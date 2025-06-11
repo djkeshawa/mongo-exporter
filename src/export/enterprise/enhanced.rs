@@ -52,6 +52,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export with full enterprise features: resumable, error handling, monitoring
+    #[allow(clippy::too_many_arguments)]
     pub async fn export_with_enterprise_features(
         &self,
         collection: &Collection<Document>,
@@ -451,6 +452,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export JSON Lines with resumable checkpointing
+    #[allow(clippy::too_many_arguments)]
     async fn export_jsonl_resumable(
         &self,
         collection: &Collection<Document>,
@@ -524,6 +526,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export JSON Array with resumable checkpointing (simplified implementation)
+    #[allow(clippy::too_many_arguments)]
     async fn export_json_array_resumable(
         &self,
         collection: &Collection<Document>,
@@ -612,6 +615,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export CSV with resumable checkpointing (simplified implementation)
+    #[allow(clippy::too_many_arguments)]
     async fn export_csv_resumable(
         &self,
         collection: &Collection<Document>,
@@ -688,6 +692,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export BSON with resumable checkpointing
+    #[allow(clippy::too_many_arguments)]
     async fn export_bson_resumable(
         &self,
         collection: &Collection<Document>,
@@ -742,6 +747,7 @@ impl EnhancedEnterpriseExporter {
     }
 
     /// Export documents in Parquet format with resumable support
+    #[allow(clippy::too_many_arguments)]
     async fn export_parquet_resumable(
         &self,
         collection: &Collection<Document>,
@@ -828,7 +834,7 @@ impl EnhancedEnterpriseExporter {
                             .resume_manager
                             .should_checkpoint(checkpoint.last_checkpoint)
                         {
-                            self.save_progress_checkpoint(&checkpoint, local_count, stats)?;
+                            self.save_progress_checkpoint(checkpoint, local_count, stats)?;
                         }
                     }
                 }

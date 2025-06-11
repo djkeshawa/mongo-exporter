@@ -77,6 +77,7 @@ impl EnterpriseExporter {
     }
 
     /// Export with enterprise options
+    #[allow(clippy::too_many_arguments)]
     pub async fn export_with_options(
         &self,
         collection: &Collection<Document>,
@@ -251,6 +252,7 @@ impl EnterpriseExporter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn export_json_lines_enterprise(
         &self,
         collection: &Collection<Document>,
@@ -318,6 +320,7 @@ impl EnterpriseExporter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn export_json_array_enterprise(
         &self,
         collection: &Collection<Document>,
@@ -388,6 +391,7 @@ impl EnterpriseExporter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn export_csv_enterprise(
         &self,
         collection: &Collection<Document>,
@@ -505,6 +509,7 @@ impl EnterpriseExporter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn export_bson_enterprise(
         &self,
         collection: &Collection<Document>,
@@ -556,6 +561,7 @@ impl EnterpriseExporter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn export_parquet_enterprise(
         &self,
         collection: &Collection<Document>,
