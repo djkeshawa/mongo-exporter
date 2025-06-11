@@ -1,11 +1,33 @@
 
 # MongoDB Export CLI
 
+[![GitHub Release](https://img.shields.io/github/v/release/djkeshawa/mongo-exporter)](https://github.com/djkeshawa/mongo-exporter/releases)
+[![CI](https://github.com/djkeshawa/mongo-exporter/workflows/CI/badge.svg)](https://github.com/djkeshawa/mongo-exporter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70+-brightgreen.svg)](https://www.rust-lang.org)
+
 A powerful, beautiful command-line tool for exporting MongoDB collections with enterprise-grade features, multiple export modes, and comprehensive format support including analytics-optimized Parquet.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                           MongoDB Export CLI
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [Export Formats](#export-formats)
+- [Command Line Options](#command-line-options)
+- [Example Sessions](#example-sessions)
+- [Filter Query Examples](#filter-query-examples)
+- [Commands](#commands)
+- [Performance Tuning](#performance-tuning)
+- [Enterprise Features](#enterprise-features)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -71,15 +93,18 @@ curl -sSL https://raw.githubusercontent.com/djkeshawa/mongo-exporter/main/instal
 ### Option 2: Manual Download
 1. Go to [Releases](https://github.com/djkeshawa/mongo-exporter/releases)
 2. Download the appropriate binary for your platform:
-   - **Linux (x86_64)**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
-   - **Linux (static)**: `mongo-exporter-x86_64-unknown-linux-musl.tar.gz`
+   - **Linux**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
    - **Windows**: `mongo-exporter-x86_64-pc-windows-msvc.zip`
-   - **macOS (Intel)**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
-   - **macOS (Apple Silicon)**: `mongo-exporter-aarch64-apple-darwin.tar.gz`
+   - **macOS**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
 3. Extract and run:
    ```bash
-   tar -xzf mongo-exporter-*.tar.gz  # Linux/macOS
+   # Linux/macOS
+   tar -xzf mongo-exporter-*.tar.gz
    ./mongo-exporter --help
+   
+   # Windows (PowerShell)
+   Expand-Archive mongo-exporter-*.zip
+   .\mongo-exporter.exe --help
    ```
 
 ### Option 3: Build from Source
@@ -95,6 +120,32 @@ cargo build --release
 ### Option 4: Cargo Install (Rust users)
 ```bash
 cargo install --git https://github.com/djkeshawa/mongo-exporter
+```
+
+## Quick Start
+
+After installation, run the CLI to start an interactive export session:
+
+```bash
+mongo-exporter
+```
+
+Or export directly with a MongoDB URI:
+
+```bash
+mongo-exporter export --uri "mongodb://localhost:27017"
+```
+
+For automation (scripts/CI/CD):
+
+```bash
+mongo-exporter export \
+  --uri "mongodb://localhost:27017" \
+  --database "myapp" \
+  --collection "users" \
+  --format json \
+  --output "users.json" \
+  --non-interactive
 ```
 
 ## Usage
