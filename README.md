@@ -61,15 +61,41 @@ A powerful, beautiful command-line tool for exporting MongoDB collections with e
 
 ## Installation
 
-Make sure you have Rust installed, then clone and build:
+### Option 1: One-Line Install (Recommended)
+Download and install the latest release automatically:
 
 ```bash
-git clone <repository-url>
-cd mongo-export-cli
-cargo build --release
+curl -sSL https://raw.githubusercontent.com/djkeshawa/mongo-exporter/main/install.sh | bash
 ```
 
-The binary will be available at `./target/release/mongo-exporter`
+### Option 2: Manual Download
+1. Go to [Releases](https://github.com/djkeshawa/mongo-exporter/releases)
+2. Download the appropriate binary for your platform:
+   - **Linux (x86_64)**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
+   - **Linux (static)**: `mongo-exporter-x86_64-unknown-linux-musl.tar.gz`
+   - **Windows**: `mongo-exporter-x86_64-pc-windows-msvc.zip`
+   - **macOS (Intel)**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
+   - **macOS (Apple Silicon)**: `mongo-exporter-aarch64-apple-darwin.tar.gz`
+3. Extract and run:
+   ```bash
+   tar -xzf mongo-exporter-*.tar.gz  # Linux/macOS
+   ./mongo-exporter --help
+   ```
+
+### Option 3: Build from Source
+If you have Rust installed:
+
+```bash
+git clone https://github.com/djkeshawa/mongo-exporter
+cd mongo-exporter
+cargo build --release
+./target/release/mongo-exporter
+```
+
+### Option 4: Cargo Install (Rust users)
+```bash
+cargo install --git https://github.com/djkeshawa/mongo-exporter
+```
 
 ## Usage
 
