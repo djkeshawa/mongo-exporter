@@ -5,146 +5,93 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release'
-        required: true
-        default: 'v0.1.0'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build for ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary-suffix: ''
-            archive-suffix: '.tar.gz'
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            binary-suffix: ''
-            archive-suffix: '.tar.gz'
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary-suffix: '.exe'
-            archive-suffix: '.zip'
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary-suffix: ''
-            archive-suffix: '.tar.gz'
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary-suffix: ''
-            archive-suffix: '.tar.gz'
-
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Build
+      run: cargo build --release
+    - name: Create archive
+      run: |
+        cd target/release
+        tar -czf ../../mongo-exporter-x86_64-unknown-linux-gnu.tar.gz mongo-exporter
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        targets: ${{ matrix.target }}
+        name: linux-binary
+        path: mongo-exporter-x86_64-unknown-linux-gnu.tar.gz
 
-    - name: Install musl tools (Linux musl)
-      if: matrix.target == 'x86_64-unknown-linux-musl'
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Build
+      run: cargo build --release
+    - name: Create archive
       run: |
-        sudo apt-get update
-        sudo apt-get install -y musl-tools
-
-    - name: Cache cargo dependencies
-      uses: actions/cache@v3
+        cd target/release
+        7z a ../../mongo-exporter-x86_64-pc-windows-msvc.zip mongo-exporter.exe
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-${{ matrix.target }}-
-          ${{ runner.os }}-cargo-
+        name: windows-binary
+        path: mongo-exporter-x86_64-pc-windows-msvc.zip
 
-    - name: Build binary
-      run: cargo build --release --target ${{ matrix.target }}
-
-    - name: Strip binary (Linux/macOS)
-      if: matrix.os != 'windows-latest'
-      run: strip target/${{ matrix.target }}/release/mongo-exporter${{ matrix.binary-suffix }}
-
-    - name: Create archive directory
-      run: mkdir -p archive
-
-    - name: Copy binary to archive (Linux/macOS)
-      if: matrix.os != 'windows-latest'
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Build
+      run: cargo build --release
+    - name: Create archive
       run: |
-        cp target/${{ matrix.target }}/release/mongo-exporter${{ matrix.binary-suffix }} archive/
-        cp README.md archive/
-        cp LICENSE archive/
-
-    - name: Copy binary to archive (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        copy target\${{ matrix.target }}\release\mongo-exporter${{ matrix.binary-suffix }} archive\
-        copy README.md archive\
-        copy LICENSE archive\
-
-    - name: Create tar.gz archive (Linux/macOS)
-      if: matrix.archive-suffix == '.tar.gz'
-      run: |
-        cd archive
-        tar -czf ../mongo-exporter-${{ matrix.target }}${{ matrix.archive-suffix }} *
-
-    - name: Create zip archive (Windows)
-      if: matrix.archive-suffix == '.zip'
-      run: |
-        cd archive
-        7z a ../mongo-exporter-${{ matrix.target }}${{ matrix.archive-suffix }} *
-
-    - name: Upload archive as artifact
-      uses: actions/upload-artifact@v3
+        cd target/release
+        tar -czf ../../mongo-exporter-x86_64-apple-darwin.tar.gz mongo-exporter
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        name: mongo-exporter-${{ matrix.target }}
-        path: mongo-exporter-${{ matrix.target }}${{ matrix.archive-suffix }}
+        name: macos-binary
+        path: mongo-exporter-x86_64-apple-darwin.tar.gz
 
   release:
     name: Create Release
-    needs: build
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+      
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
-        path: ./artifacts
-
-    - name: Display structure of downloaded files
-      run: ls -la ./artifacts/
-
-    - name: Move artifacts to release directory
-      run: |
-        mkdir -p release
-        find ./artifacts -name "*.tar.gz" -o -name "*.zip" | xargs -I {} mv {} release/
-
+        merge-multiple: true
+        path: ./release
+    
     - name: Generate checksums
       run: |
         cd release
-        sha256sum * > checksums.txt
+        sha256sum *.tar.gz *.zip > checksums.txt
+        ls -la
         cat checksums.txt
 
     - name: Get tag name
       id: tag
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          echo "tag=v0.1.0" >> $GITHUB_OUTPUT
         else
           echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
         fi
@@ -159,29 +106,24 @@ jobs:
           
           ### Installation
           
-          Download the appropriate binary for your platform:
+          **One-line install:**
+          ```bash
+          curl -sSL https://raw.githubusercontent.com/djkeshawa/mongo-exporter/main/install.sh | bash
+          ```
           
-          - **Linux (x86_64)**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
-          - **Linux (static)**: `mongo-exporter-x86_64-unknown-linux-musl.tar.gz`
+          **Manual download:**
+          - **Linux**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
           - **Windows**: `mongo-exporter-x86_64-pc-windows-msvc.zip`
-          - **macOS (Intel)**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
-          - **macOS (Apple Silicon)**: `mongo-exporter-aarch64-apple-darwin.tar.gz`
+          - **macOS**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
           
           ### Quick Start
-          
           ```bash
-          # Extract the archive
+          # Extract and run
           tar -xzf mongo-exporter-*.tar.gz  # Linux/macOS
-          # or unzip mongo-exporter-*.zip   # Windows
-          
-          # Run the CLI
           ./mongo-exporter export --uri "mongodb://localhost:27017"
           ```
           
-          ### Verify Download
-          Check the `checksums.txt` file to verify your download integrity.
-          
-          For detailed usage instructions, see the [README](https://github.com/djkeshawa/mongo-exporter#readme).
+          Verify downloads with `checksums.txt`.
         files: |
           release/*
         draft: false
