@@ -14,15 +14,14 @@ use cli::{Cli, Commands};
 use config::{parse_field_list, parse_sort_spec, ConfigManager, PerformanceConfig};
 use database::{connect_to_mongodb, select_collection, select_database};
 use export::{
-    EnhancedEnterpriseExporter, ExportOptions, MongoExportRunner, UnifiedExporter, UnifiedExportOptions,
-    display_resumable_exports, print_export_stats, ResumableExportManager,
+    display_resumable_exports, print_export_stats, EnhancedEnterpriseExporter, ExportOptions,
+    MongoExportRunner, ResumableExportManager, UnifiedExportOptions, UnifiedExporter,
 };
 use types::{CompressionType, ExportFormat, ExportMethod};
 use ui::{
     get_advanced_options, get_compression_type, get_connection_profile, get_error_handling_config,
-    get_export_format, get_export_method, get_field_selection, get_filter_query,
-    get_output_path, get_performance_mode, handle_resume_sessions, show_banner,
-    show_export_preview,
+    get_export_format, get_export_method, get_field_selection, get_filter_query, get_output_path,
+    get_performance_mode, handle_resume_sessions, show_banner, show_export_preview,
 };
 use utils::ErrorHandlingConfig;
 
@@ -107,7 +106,6 @@ struct ExportParams<'a> {
 }
 
 async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
-
     // Load configuration
     let config_manager = ConfigManager::new()?;
 
@@ -208,27 +206,30 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     };
 
     // Configure export options (CLI args take priority over interactive)
-    let mut export_options =
-        if params.fields.is_some() || params.limit.is_some() || params.skip.is_some() || params.sort.is_some() {
-            // CLI arguments provided, use them
-            ExportOptions {
-                fields: params.fields.map(|s| parse_field_list(s)),
-                limit: params.limit,
-                skip: params.skip,
-                sort: params.sort.and_then(|s| parse_sort_spec(s).ok()),
-                validate_fields: true,
-                collect_stats: true,
-            }
-        } else if params.non_interactive {
-            ExportOptions {
-                validate_fields: true,
-                collect_stats: true,
-                ..Default::default()
-            }
-        } else {
-            // Interactive mode - get advanced options
-            get_advanced_options()?
-        };
+    let mut export_options = if params.fields.is_some()
+        || params.limit.is_some()
+        || params.skip.is_some()
+        || params.sort.is_some()
+    {
+        // CLI arguments provided, use them
+        ExportOptions {
+            fields: params.fields.map(|s| parse_field_list(s)),
+            limit: params.limit,
+            skip: params.skip,
+            sort: params.sort.and_then(|s| parse_sort_spec(s).ok()),
+            validate_fields: true,
+            collect_stats: true,
+        }
+    } else if params.non_interactive {
+        ExportOptions {
+            validate_fields: true,
+            collect_stats: true,
+            ..Default::default()
+        }
+    } else {
+        // Interactive mode - get advanced options
+        get_advanced_options()?
+    };
 
     // Interactive field selection (if not specified via CLI and not in non-interactive mode)
     if export_options.fields.is_none() && !params.non_interactive {
@@ -340,16 +341,16 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         let database_name = collection.namespace().db.clone();
         let collection_name = collection.namespace().coll.clone();
 
-        let confirmed = show_export_preview(
-            &database_name,
-            &collection_name,
-            &filter,
-            &export_format,
-            &compression_type,
-            &output_path,
-            &export_options,
-            Some(total_count),
-        )?;
+        let confirmed = show_export_preview(ui::ExportPreviewParams {
+            database: &database_name,
+            collection: &collection_name,
+            filter: &filter,
+            format: &export_format,
+            compression: &compression_type,
+            output_path: &output_path,
+            options: &export_options,
+            estimated_count: Some(total_count),
+        })?;
 
         if !confirmed {
             println!("{}", style("Export cancelled by user").yellow());
@@ -368,7 +369,11 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         limit: export_options.limit,
         skip: export_options.skip,
         sort: export_options.sort,
-        force_resumable: if params.force_resumable { Some(true) } else { None },
+        force_resumable: if params.force_resumable {
+            Some(true)
+        } else {
+            None
+        },
         collect_stats: true,
         validate_fields: None, // Let unified system decide
         resume_session_id,
@@ -376,11 +381,8 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     };
 
     // Create and run unified exporter
-    let unified_exporter = UnifiedExporter::new(
-        collection,
-        Some(performance_config),
-        Some(error_config),
-    )?;
+    let unified_exporter =
+        UnifiedExporter::new(collection, Some(performance_config), Some(error_config))?;
 
     unified_exporter.export(unified_options).await?;
 

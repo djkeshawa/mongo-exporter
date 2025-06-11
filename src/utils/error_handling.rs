@@ -593,4 +593,3 @@ pub fn display_error_statistics(stats: &ErrorStatisticsReport) {
 
     println!("└{}┘", "─".repeat(50));
 }
-

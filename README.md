@@ -8,9 +8,14 @@
 
 A powerful, beautiful command-line tool for exporting MongoDB collections with enterprise-grade features, multiple export modes, and comprehensive format support including analytics-optimized Parquet.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                          MongoDB Export CLI
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+  __  __                             ____  ____    ______                       _   
+ |  \/  | ___  _ __   __ _  ___      |  _ \| __ )  | ____| __  ___ __   ___  _ __| |_ 
+ | |\/| |/ _ \| '_ \ / _` |/ _ \ ____| | | |  _ \  |  _| \ \/ / '_ \ / _ \| '__| __|
+ | |  | | (_) | | | | (_| | (_) |____| |_| | |_) | | |___ >  <| |_) | (_) | |  | |_ 
+ |_|  |_|\___/|_| |_|\__, |\___/     |____/|____/  |_____/_/\_\ .__/ \___/|_|   \__|
+                     |___/                                    |_|                   
+```
 
 ## Table of Contents
 

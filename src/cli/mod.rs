@@ -125,4 +125,3 @@ pub enum CompressionArg {
     None,
     Gzip,
 }
-

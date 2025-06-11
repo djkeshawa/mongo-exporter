@@ -12,13 +12,15 @@ use std::{
 };
 
 use crate::config::PerformanceConfig;
-use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::enterprise::enhanced::EnhancedEnterpriseExporter;
-use crate::export::enterprise::export::{EnterpriseExporter, ExportOptions as EnterpriseOptions, ExportStats};
-use crate::utils::error_handling::{AdvancedErrorHandler, ErrorHandlingConfig};
+use crate::export::enterprise::export::{
+    EnterpriseExporter, ExportOptions as EnterpriseOptions, ExportStats,
+};
+use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::formats::json_optimizer::JsonOptimizer;
 use crate::export::resumable::ResumableExportManager;
 use crate::types::{CompressionType, ExportFormat};
+use crate::utils::error_handling::{AdvancedErrorHandler, ErrorHandlingConfig};
 
 /// Unified export options combining all features
 #[derive(Debug, Clone)]
@@ -29,23 +31,23 @@ pub struct UnifiedExportOptions {
     pub output_path: String,
     pub format: ExportFormat,
     pub compression: CompressionType,
-    
+
     // Advanced options (intelligently activated)
     pub fields: Option<Vec<String>>,
     pub limit: Option<u64>,
     pub skip: Option<u64>,
     pub sort: Option<Document>,
-    
+
     // Performance tuning (auto-configured)
     pub batch_size: Option<usize>,
     pub parallel_threads: Option<usize>,
     pub buffer_size: Option<usize>,
-    
+
     // Feature flags (smart defaults)
     pub force_resumable: Option<bool>,
     pub collect_stats: bool,
     pub validate_fields: Option<bool>,
-    
+
     // Resume session ID for continuing interrupted exports
     pub resume_session_id: Option<String>,
 }
@@ -94,9 +96,9 @@ struct FormatRequirements {
 
 #[derive(Debug, Clone, Copy)]
 enum ExportStrategy {
-    FastStream,     // Direct streaming for small exports
-    Parallel,       // Parallel processing for medium exports
-    Resumable,      // Checkpoint-based for large exports
+    FastStream, // Direct streaming for small exports
+    Parallel,   // Parallel processing for medium exports
+    Resumable,  // Checkpoint-based for large exports
 }
 
 /// Unified exporter combining the best of all modes
@@ -160,19 +162,22 @@ impl UnifiedExporter {
         // Execute export with optimal strategy
         let stats = match profile.optimal_strategy {
             ExportStrategy::FastStream => {
-                self.export_fast_stream(&options, &features, progress.clone()).await?
+                self.export_fast_stream(&options, &features, progress.clone())
+                    .await?
             }
             ExportStrategy::Parallel => {
-                self.export_parallel_optimized(&options, &features, progress.clone()).await?
+                self.export_parallel_optimized(&options, &features, progress.clone())
+                    .await?
             }
             ExportStrategy::Resumable => {
-                self.export_with_checkpoints(&options, &features, progress.clone()).await?
+                self.export_with_checkpoints(&options, &features, progress.clone())
+                    .await?
             }
         };
 
         // Clean up progress task
         progress_task.abort();
-        
+
         // Finish progress bar with success message
         progress_bar.finish_with_message(format!(
             "{} Successfully exported {} documents to {} in {:.2}s",
@@ -191,7 +196,10 @@ impl UnifiedExporter {
     }
 
     /// Analyze export requirements to determine optimal configuration
-    async fn analyze_export_profile(&self, options: &UnifiedExportOptions) -> Result<ExportProfile> {
+    async fn analyze_export_profile(
+        &self,
+        options: &UnifiedExportOptions,
+    ) -> Result<ExportProfile> {
         // Get document count
         let document_count = if let Some(limit) = options.limit {
             limit.min(
@@ -210,7 +218,9 @@ impl UnifiedExporter {
         // Sample collection for size estimation
         let sample_size = 100.min(document_count);
         let avg_document_size = if sample_size > 0 {
-            let sample_docs = self.sample_collection(&options.filter, sample_size as usize).await?;
+            let sample_docs = self
+                .sample_collection(&options.filter, sample_size as usize)
+                .await?;
             self.calculate_avg_document_size(&sample_docs)
         } else {
             1024 // Default 1KB
@@ -224,11 +234,8 @@ impl UnifiedExporter {
         let format_requirements = self.get_format_requirements(&options.format);
 
         // Estimate export duration
-        let estimated_duration = self.estimate_duration(
-            document_count,
-            avg_document_size,
-            &options.format,
-        );
+        let estimated_duration =
+            self.estimate_duration(document_count, avg_document_size, &options.format);
 
         // Determine optimal strategy
         let optimal_strategy = self.determine_strategy(
@@ -256,7 +263,9 @@ impl UnifiedExporter {
         filter: &Document,
         sample_size: usize,
     ) -> Result<Vec<Document>> {
-        let options = FindOptions::builder().limit(Some(sample_size as i64)).build();
+        let options = FindOptions::builder()
+            .limit(Some(sample_size as i64))
+            .build();
 
         let mut cursor = self
             .collection
@@ -289,7 +298,8 @@ impl UnifiedExporter {
     /// Get available system memory
     fn get_available_memory(&self) -> usize {
         // Try to detect system memory, fall back to default if detection fails
-        self.detect_system_memory().unwrap_or(4 * 1024 * 1024 * 1024)
+        self.detect_system_memory()
+            .unwrap_or(4 * 1024 * 1024 * 1024)
     }
 
     /// Detect system memory using platform-specific methods
@@ -315,15 +325,15 @@ impl UnifiedExporter {
     #[cfg(target_os = "linux")]
     fn get_linux_memory(&self) -> Option<usize> {
         use std::fs;
-        
+
         // Read /proc/meminfo for MemAvailable or MemFree + Buffers + Cached
         let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-        
+
         let mut mem_available = None;
         let mut mem_free = None;
         let mut buffers = None;
         let mut cached = None;
-        
+
         for line in meminfo.lines() {
             if let Some(value) = line.strip_prefix("MemAvailable:") {
                 if let Some(kb) = Self::parse_meminfo_value(value) {
@@ -343,28 +353,26 @@ impl UnifiedExporter {
                 }
             }
         }
-        
+
         // Prefer MemAvailable if available, otherwise estimate
-        mem_available.or_else(|| {
-            match (mem_free, buffers, cached) {
-                (Some(free), Some(buf), Some(cache)) => Some(free + buf + cache),
-                _ => None,
-            }
+        mem_available.or_else(|| match (mem_free, buffers, cached) {
+            (Some(free), Some(buf), Some(cache)) => Some(free + buf + cache),
+            _ => None,
         })
     }
 
     #[cfg(target_os = "macos")]
     fn get_macos_memory(&self) -> Option<usize> {
         use std::process::Command;
-        
+
         // Use vm_stat command to get memory info
         let output = Command::new("vm_stat").output().ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        
+
         let mut page_size = 4096; // Default page size
         let mut free_pages = 0;
         let mut inactive_pages = 0;
-        
+
         for line in stdout.lines() {
             if line.contains("page size of") {
                 if let Some(size_str) = line.split_whitespace().nth(7) {
@@ -380,22 +388,22 @@ impl UnifiedExporter {
                 }
             }
         }
-        
+
         Some((free_pages + inactive_pages) * page_size)
     }
 
     #[cfg(target_os = "windows")]
     fn get_windows_memory(&self) -> Option<usize> {
         use std::process::Command;
-        
+
         // Use wmic command to get available memory
         let output = Command::new("wmic")
             .args(&["OS", "get", "FreePhysicalMemory", "/value"])
             .output()
             .ok()?;
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
-        
+
         for line in stdout.lines() {
             if line.starts_with("FreePhysicalMemory=") {
                 if let Some(kb_str) = line.split('=').nth(1) {
@@ -405,16 +413,12 @@ impl UnifiedExporter {
                 }
             }
         }
-        
+
         None
     }
 
     fn parse_meminfo_value(value: &str) -> Option<usize> {
-        value
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
+        value.split_whitespace().next()?.parse().ok()
     }
 
     /// Get format-specific requirements
@@ -457,7 +461,7 @@ impl UnifiedExporter {
     ) -> Duration {
         // Rough estimation based on format and size
         let base_rate = match format {
-            ExportFormat::JsonLines => 50_000.0,  // docs/sec
+            ExportFormat::JsonLines => 50_000.0, // docs/sec
             ExportFormat::JsonArray => 40_000.0,
             ExportFormat::Csv => 30_000.0,
             ExportFormat::Parquet => 20_000.0,
@@ -487,16 +491,19 @@ impl UnifiedExporter {
         }
 
         // Use resumable for large exports or limited memory
-        if document_count > 1_000_000 
+        if document_count > 1_000_000
             || estimated_duration > Duration::from_secs(300)
-            || available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
+            || available_memory < 2 * 1024 * 1024 * 1024
+        {
+            // Less than 2GB
             return ExportStrategy::Resumable;
         }
 
         // Use parallel for medium exports if supported and streaming capable
-        if document_count > 10_000 
-            && format_reqs.supports_parallel 
-            && format_reqs.supports_streaming {
+        if document_count > 10_000
+            && format_reqs.supports_parallel
+            && format_reqs.supports_streaming
+        {
             return ExportStrategy::Parallel;
         }
 
@@ -505,21 +512,25 @@ impl UnifiedExporter {
     }
 
     /// Configure features based on export profile
-    fn configure_features(&self, profile: &ExportProfile, options: &UnifiedExportOptions) -> ExportFeatures {
+    fn configure_features(
+        &self,
+        profile: &ExportProfile,
+        options: &UnifiedExportOptions,
+    ) -> ExportFeatures {
         ExportFeatures {
             enable_resumable: matches!(profile.optimal_strategy, ExportStrategy::Resumable),
-            enable_parallel: matches!(profile.optimal_strategy, ExportStrategy::Parallel) 
+            enable_parallel: matches!(profile.optimal_strategy, ExportStrategy::Parallel)
                 && profile.cpu_cores > 2,
             enable_validation: options.validate_fields.unwrap_or(
-                profile.format_requirements.needs_field_discovery || options.fields.is_some()
+                profile.format_requirements.needs_field_discovery || options.fields.is_some(),
             ),
             enable_compression: !matches!(options.compression, CompressionType::None),
-            batch_size: options.batch_size.unwrap_or_else(|| {
-                self.calculate_optimal_batch_size(profile)
-            }),
-            buffer_size: options.buffer_size.unwrap_or(
-                self.performance_config.write_buffer_size
-            ),
+            batch_size: options
+                .batch_size
+                .unwrap_or_else(|| self.calculate_optimal_batch_size(profile)),
+            buffer_size: options
+                .buffer_size
+                .unwrap_or(self.performance_config.write_buffer_size),
             parallel_threads: options.parallel_threads.unwrap_or_else(|| {
                 if matches!(profile.optimal_strategy, ExportStrategy::Parallel) {
                     profile.cpu_cores.min(8)
@@ -546,7 +557,7 @@ impl UnifiedExporter {
     /// Create progress bar with contextual information
     fn create_progress_bar(&self, total: u64, profile: &ExportProfile) -> ProgressBar {
         let pb = ProgressBar::new(total);
-        
+
         let template = match profile.optimal_strategy {
             ExportStrategy::FastStream => {
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} ({rate}/s) [{eta}]"
@@ -587,16 +598,19 @@ impl UnifiedExporter {
         println!(
             "  Processing {} documents (~{}) - estimated time: {:.1}s",
             style(profile.document_count.to_string()).white(),
-            humansize::format_size(profile.document_count * profile.avg_document_size as u64, humansize::BINARY),
+            humansize::format_size(
+                profile.document_count * profile.avg_document_size as u64,
+                humansize::BINARY
+            ),
             profile.estimated_duration.as_secs_f64()
         );
-        
+
         let strategy_desc = match profile.optimal_strategy {
             ExportStrategy::FastStream => "Fast streaming".to_string(),
             ExportStrategy::Parallel => format!("Parallel ({} threads)", profile.cpu_cores.min(8)),
             ExportStrategy::Resumable => "Resumable with checkpoints".to_string(),
         };
-        
+
         println!(
             "  {} Strategy: {} (memory: {})",
             style("⚙️").cyan(),
@@ -627,33 +641,50 @@ impl UnifiedExporter {
         println!();
         println!("{} Export Statistics", style("📊").cyan().bold());
         println!("┌─────────────────────────────────────────────────────┐");
-        println!("│ Documents processed:                    {:>11} │", stats.documents_processed);
-        println!("│ Documents exported:                     {:>11} │", stats.documents_exported);
-        
+        println!(
+            "│ Documents processed:                    {:>11} │",
+            stats.documents_processed
+        );
+        println!(
+            "│ Documents exported:                     {:>11} │",
+            stats.documents_exported
+        );
+
         if stats.fields_discovered > 0 {
-            println!("│ Fields discovered:                      {:>11} │", stats.fields_discovered);
+            println!(
+                "│ Fields discovered:                      {:>11} │",
+                stats.fields_discovered
+            );
         }
-        
-        println!("│ Bytes written:                         {:>12} │", 
+
+        println!(
+            "│ Bytes written:                         {:>12} │",
             humansize::format_size(stats.bytes_written, humansize::BINARY)
         );
-        
-        println!("│ Processing time:                          {:>9.2}s │", 
+
+        println!(
+            "│ Processing time:                          {:>9.2}s │",
             stats.processing_time_ms as f64 / 1000.0
         );
-        
+
         let throughput = if stats.processing_time_ms > 0 {
             (stats.documents_exported as f64 / (stats.processing_time_ms as f64 / 1000.0)) as u64
         } else {
             0
         };
-        
-        println!("│ Throughput:                           {:>9} /s │", throughput);
-        
+
+        println!(
+            "│ Throughput:                           {:>9} /s │",
+            throughput
+        );
+
         if !stats.errors.is_empty() {
-            println!("│ Errors encountered:                     {:>11} │", stats.errors.len());
+            println!(
+                "│ Errors encountered:                     {:>11} │",
+                stats.errors.len()
+            );
         }
-        
+
         println!("└─────────────────────────────────────────────────────┘");
     }
 
@@ -665,11 +696,15 @@ impl UnifiedExporter {
         progress: Arc<AtomicU64>,
     ) -> Result<ExportStats> {
         // Use features for optimization
-        println!("{} Fast streaming mode: batch_size={}, buffer_size={}KB", 
-                 style("◦").dim(), features.batch_size, features.buffer_size / 1024);
-        
+        println!(
+            "{} Fast streaming mode: batch_size={}, buffer_size={}KB",
+            style("◦").dim(),
+            features.batch_size,
+            features.buffer_size / 1024
+        );
+
         let start_time = std::time::Instant::now();
-        
+
         // Use optimized exporters from basic mode
         match options.format {
             ExportFormat::JsonLines => {
@@ -710,18 +745,20 @@ impl UnifiedExporter {
             }
             _ => {
                 // Fall back to enterprise exporter for other formats
-                return self.export_with_enterprise(options, features, progress).await;
+                return self
+                    .export_with_enterprise(options, features, progress)
+                    .await;
             }
         }
 
         // Calculate processing time
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
-        
+
         // Get file size for bytes_written
         let bytes_written = std::fs::metadata(&options.output_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        
+
         // Create stats with actual values
         let exported = progress.load(Ordering::Relaxed);
         Ok(ExportStats {
@@ -742,10 +779,14 @@ impl UnifiedExporter {
     ) -> Result<ExportStats> {
         // Show parallel configuration
         if features.enable_parallel {
-            println!("{} Parallel mode: {} threads, batch_size={}", 
-                     style("◦").dim(), features.parallel_threads, features.batch_size);
+            println!(
+                "{} Parallel mode: {} threads, batch_size={}",
+                style("◦").dim(),
+                features.parallel_threads,
+                features.batch_size
+            );
         }
-        
+
         // Reuse fast stream with parallel enabled
         self.export_fast_stream(options, features, progress).await
     }
@@ -759,8 +800,11 @@ impl UnifiedExporter {
     ) -> Result<ExportStats> {
         // Show resumable configuration
         if features.enable_resumable {
-            println!("{} Resumable mode: checkpointing enabled, batch_size={}", 
-                     style("◦").dim(), features.batch_size);
+            println!(
+                "{} Resumable mode: checkpointing enabled, batch_size={}",
+                style("◦").dim(),
+                features.batch_size
+            );
         }
         if features.enable_validation {
             println!("{} Field validation enabled", style("◦").dim());
@@ -822,12 +866,16 @@ impl UnifiedExporter {
         session_id: &str,
         options: UnifiedExportOptions,
     ) -> Result<ExportStats> {
-        println!("{} Resuming export session: {}", style("◦").dim(), session_id);
+        println!(
+            "{} Resuming export session: {}",
+            style("◦").dim(),
+            session_id
+        );
 
         // Use the embedded resume manager and error handler for advanced resumable exports
         let _can_resume = self.resume_manager.list_sessions().is_ok();
         let _error_stats = self.error_handler.get_statistics();
-        
+
         let enhanced_exporter = EnhancedEnterpriseExporter::new(
             self.performance_config.clone(),
             Some(ErrorHandlingConfig::default()),

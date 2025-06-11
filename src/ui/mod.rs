@@ -8,10 +8,10 @@ use std::path::Path;
 use crate::config::PerformanceConfig;
 use crate::config::{ConfigManager, ConnectionProfile};
 use crate::export::enterprise::export::ExportOptions;
-use crate::utils::error_handling::ErrorHandlingConfig;
 use crate::export::mongoexport::MongoExportRunner;
 use crate::export::resumable::ResumableExportManager;
 use crate::types::{CompressionType, ExportFormat, ExportMethod};
+use crate::utils::error_handling::ErrorHandlingConfig;
 
 pub fn create_theme() -> ColorfulTheme {
     ColorfulTheme {
@@ -56,10 +56,7 @@ pub fn show_selection_section(title: &str, description: &str) {
 
 pub fn show_result_section(message: &str, is_success: bool) {
     let (styled_icon, styled_message) = if is_success {
-        (
-            style("✓").green().bold(),
-            style(message).green().bold(),
-        )
+        (style("✓").green().bold(), style(message).green().bold())
     } else {
         (style("✗").red().bold(), style(message).red().bold())
     };
@@ -764,10 +761,7 @@ pub fn get_advanced_options() -> Result<ExportOptions> {
                 println!("{} Set skip to {} documents", style("✓").green(), skip);
             }
             Err(_) => {
-                println!(
-                    "{} Invalid skip number, using no skip",
-                    style("!").yellow()
-                );
+                println!("{} Invalid skip number, using no skip", style("!").yellow());
             }
         }
     }
@@ -890,29 +884,41 @@ pub fn handle_resume_sessions() -> Result<Option<String>> {
     }
 }
 
+/// Parameters for export preview
+pub struct ExportPreviewParams<'a> {
+    pub database: &'a str,
+    pub collection: &'a str,
+    pub filter: &'a Document,
+    pub format: &'a ExportFormat,
+    pub compression: &'a CompressionType,
+    pub output_path: &'a str,
+    pub options: &'a ExportOptions,
+    pub estimated_count: Option<u64>,
+}
+
 /// Show export preview and get confirmation
-pub fn show_export_preview(
-    database: &str,
-    collection: &str,
-    filter: &Document,
-    format: &ExportFormat,
-    compression: &CompressionType,
-    output_path: &str,
-    options: &ExportOptions,
-    estimated_count: Option<u64>,
-) -> Result<bool> {
+pub fn show_export_preview(params: ExportPreviewParams) -> Result<bool> {
     println!();
-    println!("{} {}", style("📋").cyan(), style("Export Preview").cyan().bold());
+    println!(
+        "{} {}",
+        style("📋").cyan(),
+        style("Export Preview").cyan().bold()
+    );
     println!();
 
     // Connection info
-    println!("   {}: {}.{}", style("Database").dim(), database, collection);
+    println!(
+        "   {}: {}.{}",
+        style("Database").dim(),
+        params.database,
+        params.collection
+    );
 
     // Filter
-    let filter_display = if filter.is_empty() {
+    let filter_display = if params.filter.is_empty() {
         "All documents".to_string()
     } else {
-        let filter_str = format!("{}", filter);
+        let filter_str = format!("{}", params.filter);
         if filter_str.len() > 60 {
             format!("{}...", &filter_str[..57])
         } else {
@@ -922,21 +928,21 @@ pub fn show_export_preview(
     println!("   {}: {}", style("Filter").dim(), filter_display);
 
     // Format and compression
-    println!("   {}: {}", style("Format").dim(), format.to_string());
-    println!("   {}: {}", style("Compression").dim(), compression.to_string());
-    println!("   {}: {}", style("Output").dim(), output_path);
+    println!("   {}: {}", style("Format").dim(), params.format);
+    println!("   {}: {}", style("Compression").dim(), params.compression);
+    println!("   {}: {}", style("Output").dim(), params.output_path);
 
     // Advanced options
-    if let Some(limit) = options.limit {
+    if let Some(limit) = params.options.limit {
         println!("   {}: {} documents", style("Limit").dim(), limit);
     }
-    if let Some(skip) = options.skip {
+    if let Some(skip) = params.options.skip {
         println!("   {}: {} documents", style("Skip").dim(), skip);
     }
-    if options.sort.is_some() {
+    if params.options.sort.is_some() {
         println!("   {}: Enabled", style("Sort").dim());
     }
-    if let Some(ref fields) = options.fields {
+    if let Some(ref fields) = params.options.fields {
         let fields_display = if fields.len() <= 3 {
             fields.join(", ")
         } else {
@@ -946,7 +952,7 @@ pub fn show_export_preview(
     }
 
     // Estimated count
-    if let Some(count) = estimated_count {
+    if let Some(count) = params.estimated_count {
         println!("   {}: {}", style("Est. Documents").dim(), count);
     }
 

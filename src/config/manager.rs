@@ -66,7 +66,6 @@ pub struct GlobalSettings {
     pub log_level: String,
 }
 
-
 impl Default for ConnectionProfile {
     fn default() -> Self {
         Self {

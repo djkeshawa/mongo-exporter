@@ -13,15 +13,17 @@ use std::{
 };
 
 use crate::config::PerformanceConfig;
-use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::enterprise::export::{ExportOptions, ExportStats};
-use crate::utils::error_handling::{display_error_statistics, AdvancedErrorHandler, ErrorHandlingConfig};
+use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::formats::json_optimizer::JsonOptimizer;
 use crate::export::resumable::{
     CheckpointStats, CursorState, ExportCheckpoint, ExportConfig, ExportProgress, OutputMode,
     ResumableExportManager, ResumeInfo,
 };
 use crate::types::{CompressionType, ExportFormat};
+use crate::utils::error_handling::{
+    display_error_statistics, AdvancedErrorHandler, ErrorHandlingConfig,
+};
 
 /// Enhanced enterprise exporter with resumable exports and advanced error handling
 pub struct EnhancedEnterpriseExporter {
@@ -751,7 +753,6 @@ impl EnhancedEnterpriseExporter {
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-
         println!(
             "{} Starting Parquet export with columnar optimization...",
             style("📊").cyan()
@@ -779,7 +780,9 @@ impl EnhancedEnterpriseExporter {
         // Create Arrow schema from discovered fields
         let arrow_fields: Vec<arrow::datatypes::Field> = fields
             .iter()
-            .map(|field_name| arrow::datatypes::Field::new(field_name, arrow::datatypes::DataType::Utf8, true))
+            .map(|field_name| {
+                arrow::datatypes::Field::new(field_name, arrow::datatypes::DataType::Utf8, true)
+            })
             .collect();
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
 
@@ -789,9 +792,9 @@ impl EnhancedEnterpriseExporter {
 
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(match compression {
-                CompressionType::Gzip => parquet::basic::Compression::GZIP(
-                    parquet::basic::GzipLevel::default(),
-                ),
+                CompressionType::Gzip => {
+                    parquet::basic::Compression::GZIP(parquet::basic::GzipLevel::default())
+                }
                 CompressionType::None => parquet::basic::Compression::UNCOMPRESSED,
             })
             .build();
@@ -813,7 +816,7 @@ impl EnhancedEnterpriseExporter {
             match result {
                 Ok(document) => {
                     document_batch.push(document);
-                    
+
                     if document_batch.len() >= batch_size {
                         self.write_parquet_batch(&mut writer, &document_batch, &fields, stats)?;
                         local_count += document_batch.len() as u64;
@@ -872,7 +875,7 @@ impl EnhancedEnterpriseExporter {
 
         for field in fields {
             let mut field_values = Vec::with_capacity(documents.len());
-            
+
             for document in documents {
                 let value = crate::utils::get_field_value(document, field);
                 field_values.push(if value.is_empty() { None } else { Some(value) });
@@ -884,13 +887,18 @@ impl EnhancedEnterpriseExporter {
 
         // Create record batch
         let batch = arrow::record_batch::RecordBatch::try_from_iter(
-            fields.iter().zip(columns.iter()).map(|(name, array)| (name.as_str(), array.clone()))
+            fields
+                .iter()
+                .zip(columns.iter())
+                .map(|(name, array)| (name.as_str(), array.clone())),
         )
         .context("Failed to create Arrow record batch")?;
 
         // Write batch to Parquet
-        writer.write(&batch).context("Failed to write Parquet batch")?;
-        
+        writer
+            .write(&batch)
+            .context("Failed to write Parquet batch")?;
+
         stats.documents_processed += documents.len() as u64;
         stats.bytes_written += batch.get_array_memory_size() as u64;
 
