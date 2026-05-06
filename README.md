@@ -95,6 +95,106 @@ A powerful, beautiful command-line tool for exporting MongoDB collections with e
 - **Optimized I/O**: Buffered writers and batch processing
 - **Smart Batching**: Configurable batch sizes for different scenarios
 
+### 🔐 **Security Features** (NEW!)
+- **URI Masking**: Automatic masking of passwords in logs and error messages
+- **Environment Variables**: Support for `MONGODB_URI` and `MONGO_URI` environment variables
+- **Path Validation**: Protection against path traversal attacks
+- **Input Sanitization**: Comprehensive validation of all user inputs
+
+## Security
+
+### Automatic URI Masking
+All MongoDB connection URIs are automatically masked in logs and error messages to prevent credential leakage:
+
+```bash
+# Your URI:
+mongodb://admin:secretPassword@localhost:27017
+
+# What appears in logs:
+✅ Connected to MongoDB at mongodb://admin:****@localhost:27017
+```
+
+This applies to:
+- Connection messages
+- Error messages
+- Progress updates
+- All console output
+
+### Environment Variable Support
+Avoid exposing credentials in command history by using environment variables:
+
+```bash
+# Set MongoDB URI in environment
+export MONGODB_URI="mongodb://user:password@localhost:27017"
+
+# Or use MONGO_URI
+export MONGO_URI="mongodb+srv://user:password@cluster.mongodb.net"
+
+# Run without --uri flag
+./mongo-exporter export --non-interactive \
+  --database "mydb" \
+  --collection "users" \
+  --output "users.json"
+
+# Output shows:
+# 🔗 Using MongoDB URI from environment variable
+# ✅ Connected to MongoDB at mongodb://user:****@localhost:27017
+```
+
+**Priority Order**:
+1. `--uri` CLI flag
+2. `MONGODB_URI` environment variable
+3. `MONGO_URI` environment variable
+4. Connection profile
+5. Interactive prompt
+
+### Path Security
+Protection against path traversal attacks:
+
+```bash
+# Dangerous paths are automatically blocked
+./mongo-exporter export --output "../../../etc/passwd"
+# Error: Path contains '..' which could lead to path traversal attack
+
+# Parent directories are validated
+./mongo-exporter export --output "/nonexistent/dir/file.json"
+# Error: Parent directory does not exist: /nonexistent/dir
+
+# Session IDs are validated (resume command)
+./mongo-exporter resume "../../../tmp/evil"
+# Error: Invalid session ID: only alphanumerics, '-', and '_' are allowed
+```
+
+### Checkpoint Files
+Resumable exports write checkpoint files to `~/.cache/mongo-exporter/checkpoints/`:
+
+- **No credentials on disk**: the connection URI is not persisted to the checkpoint, so resuming requires re-supplying `--uri` (or `MONGODB_URI`).
+- **Owner-only permissions**: checkpoint files are created with `0o600` on Unix to limit exposure of filter and field metadata.
+
+## Testing
+
+Run the comprehensive test suite:
+
+```bash
+# Run all tests
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run specific module tests
+cargo test secrets
+cargo test config
+```
+
+**Test Coverage**:
+- **46 tests** with **100% pass rate**
+- Core modules well-tested
+- Security features fully covered (URI masking, path traversal, session ID validation)
+- Plain-JSON output and BSON type conversion regression-tested
+
+See [TESTING.md](TESTING.md) for detailed testing guide.
+
 ## Installation
 
 ### Option 1: One-Line Install (Recommended)
@@ -162,6 +262,8 @@ mongo-exporter export \
   --non-interactive
 ```
 
+The export pipeline (`UnifiedExporter`) automatically picks the right strategy — fast streaming, parallel, or resumable with checkpoints — based on the collection size, available memory, and selected format. There is no manual `--mode` flag.
+
 ## Usage
 
 ### Interactive Mode (Recommended)
@@ -182,19 +284,7 @@ Perfect for scripts and CI/CD pipelines:
   --query '{"status": "active"}' \
   --format jsonl \
   --output users_active.jsonl \
-  --mode enterprise \
   --non-interactive
-```
-
-### Export Mode Selection
-Choose between Basic and Enterprise modes:
-
-```bash
-# Basic mode - fast and simple
-./target/release/mongo-exporter export --mode basic
-
-# Enterprise mode - advanced features and statistics  
-./target/release/mongo-exporter export --mode enterprise
 ```
 
 ### Connection Examples
@@ -222,19 +312,20 @@ mongo-exporter export --uri "mongodb://admin:password@localhost:27017"
 ## Export Formats
 
 ### JSON Lines (.jsonl) - Streaming Optimized
-One JSON document per line - ideal for streaming and large datasets:
+One JSON document per line — ideal for streaming and large datasets. Output is **plain JSON**: ObjectIds become hex strings, dates become ISO-8601, Decimal128 becomes a string. The previous Extended JSON v2 wrappers (`{"$oid": ...}`, `{"$date": {"$numberLong": ...}}`, `{"$numberDecimal": ...}`) have been removed for compatibility with `jq`, pandas, and ad-hoc scripts.
+
 ```json
-{"_id":"507f1f77bcf86cd799439011","name":"John","age":25}
-{"_id":"507f1f77bcf86cd799439012","name":"Jane","age":30}
+{"_id":"507f1f77bcf86cd799439011","name":"John","age":25,"created_at":"2024-01-15T08:30:00Z"}
+{"_id":"507f1f77bcf86cd799439012","name":"Jane","age":30,"balance":"1500.75"}
 ```
 
-### JSON Array (.json) - Pretty Printed  
-Pretty-printed JSON array - good for smaller datasets:
+### JSON Array (.json) - Pretty Printed
+Pretty-printed JSON array — good for smaller datasets. Same plain-JSON conventions as above:
 ```json
 [
   {
     "_id": "507f1f77bcf86cd799439011",
-    "name": "John", 
+    "name": "John",
     "age": 25
   },
   {
@@ -280,9 +371,9 @@ MongoDB's native binary format for perfect data fidelity:
 ### Export Configuration
 ```bash
 --format <FORMAT>          Export format: jsonl, json, csv, parquet, bson
---mode <MODE>             Export mode: basic, enterprise
 --compression <TYPE>       Compression: none, gzip
 --non-interactive         Run without user prompts
+--resumable               Force resumable strategy (auto-selected for large collections)
 ```
 
 ### Advanced Options
@@ -296,7 +387,7 @@ MongoDB's native binary format for perfect data fidelity:
 
 ## Example Sessions
 
-### Interactive Enterprise Export
+### Interactive Export
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                           MongoDB Export CLI
@@ -321,10 +412,6 @@ MongoDB's native binary format for perfect data fidelity:
 ❯ users
   orders
 
-? Select export mode ›
-  Basic (Simple, fast exports)
-❯ Enterprise (Advanced features, statistics, resumable)
-
 ? Enter the filter query (JSON format) › {"status": "active", "age": {"$gte": 18}}
 
 ? Select export format ›
@@ -334,7 +421,7 @@ MongoDB's native binary format for perfect data fidelity:
 ❯ Parquet (.parquet) - Analytics optimized
   BSON (.bson) - MongoDB native format
 
-🚀 Starting enterprise export...
+🚀 Starting export...
 📊 Starting Parquet export with columnar optimization...
 🔍 Discovered 25 fields for Parquet schema
 
@@ -350,7 +437,7 @@ MongoDB's native binary format for perfect data fidelity:
 │ Throughput:                              82 docs/sec │
 └──────────────────────────────────────────────────────┘
 
-✅ Enterprise export completed successfully!
+✅ Export completed successfully!
 ```
 
 ### Automated Script Example
@@ -366,7 +453,6 @@ MongoDB's native binary format for perfect data fidelity:
   --format parquet \
   --compression gzip \
   --output "analytics/users_2024.parquet.gz" \
-  --mode enterprise \
   --non-interactive
 
 # Export orders as CSV for reporting
@@ -378,7 +464,6 @@ MongoDB's native binary format for perfect data fidelity:
   --query '{"status": {"$in": ["completed", "shipped"]}}' \
   --format csv \
   --output "reports/completed_orders.csv" \
-  --mode basic \
   --non-interactive
 ```
 
@@ -439,10 +524,9 @@ MongoDB's native binary format for perfect data fidelity:
 Main export command with interactive or non-interactive modes.
 
 **Options:**
-- Interactive mode: Guided prompts for all configuration
-- Non-interactive mode: Command-line arguments only
-- Basic mode: Fast, simple exports
-- Enterprise mode: Advanced features and statistics
+- Interactive mode: guided prompts for all configuration
+- Non-interactive mode: command-line arguments only
+- Strategy is auto-selected (fast streaming / pipelined / resumable) based on collection size and chosen format
 
 ### `resume`
 Resume a previously interrupted export from checkpoint.
@@ -451,12 +535,19 @@ Resume a previously interrupted export from checkpoint.
 # List available resume sessions
 mongo-exporter list
 
-# Resume specific session
-mongo-exporter resume <session-id>
+# Resume a specific session — requires --uri or MONGODB_URI
+mongo-exporter resume <session-id> --uri "mongodb://..."
 
-# Resume interactively (will show available sessions)
+# Without a session id, prints available sessions
 mongo-exporter resume
 ```
+
+> **Note**: The MongoDB URI is no longer persisted in checkpoint files (security fix), so the `resume` command requires the URI to be supplied again via `--uri` or the `MONGODB_URI`/`MONGO_URI` environment variable.
+>
+> **Format limitations on resume**:
+> - **Parquet** cannot be resumed — the row-group index lives in the file footer, so partial files are not appendable. Re-run the export from scratch.
+> - **Gzip-compressed** outputs cannot be resumed — multi-stream gzip files are not portable across all readers (Python's `gzip` module reads only the first stream). Re-run without `--compression gzip`, or omit `--resume`.
+> - **JSONL**, **JSON Array**, **CSV**, and **BSON** all support resume.
 
 ### `list`
 Display available resumable export sessions.
@@ -502,7 +593,7 @@ Maximum performance with higher memory usage:
 ## Enterprise Features
 
 ### Export Statistics
-Detailed metrics provided in Enterprise mode:
+Detailed metrics surfaced after every export:
 - Documents processed, exported, and skipped
 - Fields discovered (for CSV/Parquet)
 - Bytes written and processing time
