@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
-use flate2::{write::GzEncoder, Compression};
 use futures::stream::StreamExt;
 use mongodb::{bson::Document, Collection};
 use std::{
-    io::{BufWriter, Write},
+    io::Write,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Instant,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::config::PerformanceConfig;
 use crate::types::CompressionType;
@@ -32,6 +31,7 @@ impl JsonOptimizer {
         output_path: &str,
         compression: &CompressionType,
         exported_count: Arc<AtomicU64>,
+        find_options: Option<mongodb::options::FindOptions>,
     ) -> Result<()> {
         let start_time = Instant::now();
 
@@ -46,8 +46,15 @@ impl JsonOptimizer {
         // Spawn document fetcher task
         let collection_clone = collection.clone();
         let filter_clone = filter.clone();
+        let find_options_clone = find_options.clone();
         let fetch_handle = tokio::spawn(async move {
-            Self::fetch_documents(collection_clone, filter_clone, document_tx).await
+            Self::fetch_documents(
+                collection_clone,
+                filter_clone,
+                document_tx,
+                find_options_clone,
+            )
+            .await
         });
 
         // For now, use single worker to avoid receiver cloning issues
@@ -66,13 +73,33 @@ impl JsonOptimizer {
             Self::write_json_lines(writer_clone, json_rx, config, exported_count_clone).await
         });
 
-        // Wait for all tasks to complete
-        fetch_handle.await??;
-        worker_handle.await??;
-        write_handle.await??;
+        // Guard each task so an early `?` return aborts in-flight siblings rather than
+        // leaving them running detached against a half-flushed writer.
+        struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+        impl<T> AbortOnDrop<T> {
+            fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
+                self.0.take().expect("handle taken twice")
+            }
+        }
+        impl<T> Drop for AbortOnDrop<T> {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.abort();
+                }
+            }
+        }
+        let fetch_guard = AbortOnDrop(Some(fetch_handle));
+        let worker_guard = AbortOnDrop(Some(worker_handle));
+        let write_guard = AbortOnDrop(Some(write_handle));
+
+        // Wait for all tasks to complete. Order matters: the writer drains last after the
+        // upstream channels close, so awaiting it last lets us surface its error preferentially.
+        fetch_guard.into_inner().await??;
+        worker_guard.into_inner().await??;
+        write_guard.into_inner().await??;
 
         // Final flush
-        let mut writer_guard = writer.lock().unwrap();
+        let mut writer_guard = writer.lock().await;
         writer_guard
             .flush()
             .context("Failed to flush final output")?;
@@ -99,6 +126,7 @@ impl JsonOptimizer {
         output_path: &str,
         compression: &CompressionType,
         exported_count: Arc<AtomicU64>,
+        find_options: Option<mongodb::options::FindOptions>,
     ) -> Result<()> {
         let start_time = Instant::now();
 
@@ -109,14 +137,14 @@ impl JsonOptimizer {
 
         // Write array start
         {
-            let mut writer_guard = writer.lock().unwrap();
+            let mut writer_guard = writer.lock().await;
             writer_guard
                 .write_all(b"[\n")
                 .context("Failed to write array start")?;
         }
 
         let mut cursor = collection
-            .find(filter.clone(), None)
+            .find(filter.clone(), find_options)
             .await
             .context("Failed to execute query")?;
 
@@ -156,7 +184,7 @@ impl JsonOptimizer {
 
         // Write array end
         {
-            let mut writer_guard = writer.lock().unwrap();
+            let mut writer_guard = writer.lock().await;
             writer_guard
                 .write_all(b"\n]\n")
                 .context("Failed to write array end")?;
@@ -183,35 +211,21 @@ impl JsonOptimizer {
         output_path: &str,
         compression: &CompressionType,
     ) -> Result<Box<dyn Write + Send>> {
-        use std::fs::File;
-
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
-
-        let writer: Box<dyn Write + Send> = match compression {
-            CompressionType::None => Box::new(BufWriter::with_capacity(
-                self.config.write_buffer_size,
-                file,
-            )),
-            CompressionType::Gzip => {
-                let gz_encoder = GzEncoder::new(file, Compression::default());
-                Box::new(BufWriter::with_capacity(
-                    self.config.write_buffer_size,
-                    gz_encoder,
-                ))
-            }
-        };
-
-        Ok(writer)
+        crate::utils::create_buffered_writer(
+            output_path,
+            compression,
+            self.config.write_buffer_size,
+        )
     }
 
     async fn fetch_documents(
         collection: Collection<Document>,
         filter: Document,
         tx: mpsc::Sender<Document>,
+        find_options: Option<mongodb::options::FindOptions>,
     ) -> Result<()> {
         let mut cursor = collection
-            .find(filter, None)
+            .find(filter, find_options)
             .await
             .context("Failed to execute query")?;
 
@@ -240,8 +254,8 @@ impl JsonOptimizer {
         let mut processed = 0;
 
         while let Some(document) = rx.recv().await {
-            let json_str =
-                serde_json::to_string(&document).context("Failed to serialize document to JSON")?;
+            let json_str = serde_json::to_string(&crate::utils::document_to_json_value(&document))
+                .context("Failed to serialize document to JSON")?;
 
             // Processing completed
 
@@ -274,26 +288,24 @@ impl JsonOptimizer {
             // Flush buffer when it gets large
             if buffer.len() > config.batch_flush_threshold {
                 {
-                    let mut writer_guard = writer.lock().unwrap();
+                    let mut writer_guard = writer.lock().await;
                     writer_guard
                         .write_all(buffer.as_bytes())
                         .context("Failed to write JSON batch")?;
                 }
                 buffer.clear();
                 exported_count.store(count, Ordering::Relaxed);
-
-                // Buffer flushed
             }
 
             // Periodic progress updates
-            if count % 1000 == 0 {
+            if count.is_multiple_of(1000) {
                 exported_count.store(count, Ordering::Relaxed);
             }
         }
 
         // Write remaining buffer
         if !buffer.is_empty() {
-            let mut writer_guard = writer.lock().unwrap();
+            let mut writer_guard = writer.lock().await;
             writer_guard
                 .write_all(buffer.as_bytes())
                 .context("Failed to write final JSON batch")?;
@@ -309,45 +321,47 @@ impl JsonOptimizer {
         writer: &Arc<Mutex<Box<dyn Write + Send>>>,
         needs_comma_prefix: bool,
     ) -> Result<()> {
-        // Parallel serialization
-        let json_strings = if documents.len() > 50 {
-            use rayon::prelude::*;
-            documents
-                .par_iter()
-                .map(serde_json::to_string_pretty)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("Failed to serialize documents to JSON")?
+        // Serialize on a blocking thread when the batch is big enough to benefit from rayon —
+        // running rayon directly on a tokio worker can starve the runtime.
+        let json_strings: Vec<String> = if documents.len() > 50 {
+            let documents = documents.to_vec();
+            tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                documents
+                    .par_iter()
+                    .map(|d| {
+                        serde_json::to_string_pretty(&crate::utils::document_to_json_value(d))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await
+            .context("Parallel JSON serialization task panicked")?
+            .context("Failed to serialize documents to JSON")?
         } else {
             documents
                 .iter()
-                .map(serde_json::to_string_pretty)
+                .map(|d| serde_json::to_string_pretty(&crate::utils::document_to_json_value(d)))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context("Failed to serialize documents to JSON")?
         };
 
-        // Sequential writing for correct JSON array format
-        let mut writer_guard = writer.lock().unwrap();
-
+        // Build the formatted batch off-lock so we hold the writer mutex for one bulk write.
+        let mut formatted = String::with_capacity(self.config.string_buffer_size);
         for (i, json_str) in json_strings.iter().enumerate() {
             if needs_comma_prefix || i > 0 {
-                writer_guard
-                    .write_all(b",\n")
-                    .context("Failed to write comma")?;
+                formatted.push_str(",\n");
             }
-
-            // Indent each line
             for line in json_str.lines() {
-                writer_guard
-                    .write_all(b"  ")
-                    .context("Failed to write indent")?;
-                writer_guard
-                    .write_all(line.as_bytes())
-                    .context("Failed to write line")?;
-                writer_guard
-                    .write_all(b"\n")
-                    .context("Failed to write newline")?;
+                formatted.push_str("  ");
+                formatted.push_str(line);
+                formatted.push('\n');
             }
         }
+
+        let mut writer_guard = writer.lock().await;
+        writer_guard
+            .write_all(formatted.as_bytes())
+            .context("Failed to write JSON batch")?;
 
         Ok(())
     }

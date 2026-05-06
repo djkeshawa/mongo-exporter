@@ -15,21 +15,38 @@ use config::{parse_field_list, parse_sort_spec, ConfigManager, PerformanceConfig
 use database::{connect_to_mongodb, select_collection, select_database};
 use export::{
     display_resumable_exports, print_export_stats, EnhancedEnterpriseExporter, ExportOptions,
-    MongoExportRunner, ResumableExportManager, UnifiedExportOptions, UnifiedExporter,
+    ResumableExportManager, UnifiedExportOptions, UnifiedExporter,
 };
-use types::{CompressionType, ExportFormat, ExportMethod};
+use types::{CompressionType, ExportFormat};
 use ui::{
     get_advanced_options, get_compression_type, get_connection_profile, get_error_handling_config,
-    get_export_format, get_export_method, get_field_selection, get_filter_query, get_output_path,
+    get_export_format, get_field_selection, get_filter_query, get_output_path,
     get_performance_mode, handle_resume_sessions, show_banner, show_export_preview,
 };
-use utils::ErrorHandlingConfig;
+use utils::{get_uri_from_env_or_provided, validate_output_path, ErrorHandlingConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load environment variables from .env file if it exists
+    // This allows users to store their MongoDB URI and other config in .env
+    if let Err(e) = dotenvy::dotenv() {
+        // Only show error if .env file exists but couldn't be read
+        if e.not_found() {
+            // .env file doesn't exist - this is fine, not all users need it
+        } else {
+            eprintln!("⚠️  Warning: Could not load .env file: {}", e);
+        }
+    }
+
     let cli = Cli::parse();
 
-    show_banner();
+    let interactive = match &cli.command {
+        Some(Commands::Export(opts)) => !opts.non_interactive,
+        _ => true,
+    };
+    if interactive {
+        show_banner();
+    }
 
     match &cli.command {
         Some(Commands::Export(export_opts)) => {
@@ -54,7 +71,7 @@ async fn main() -> Result<()> {
             .await?;
         }
         Some(Commands::Resume { session_id }) => {
-            run_resume_command(session_id.as_ref()).await?;
+            run_resume_command(session_id.as_ref(), cli.uri.as_ref()).await?;
         }
         Some(Commands::List) => {
             run_list_command().await?;
@@ -116,10 +133,19 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         params.resume_session_id
     };
 
-    // Get connection URI (priority: CLI arg -> profile -> interactive)
-    let uri = if let Some(uri) = params.connection_uri {
-        println!("{} Using provided MongoDB URI", style("🔗").cyan());
-        uri.clone()
+    // Get connection URI (priority: CLI arg -> environment -> profile -> interactive)
+    let uri = if let Some(uri_from_env_or_cli) =
+        get_uri_from_env_or_provided(params.connection_uri.map(|s| s.as_str()))
+    {
+        if params.connection_uri.is_some() {
+            println!("{} Using provided MongoDB URI", style("🔗").cyan());
+        } else {
+            println!(
+                "{} Using MongoDB URI from environment variable",
+                style("🔗").cyan()
+            );
+        }
+        uri_from_env_or_cli
     } else if let Some(profile_name) = params.profile {
         if let Some(profile) = config_manager.get_profile(profile_name) {
             println!(
@@ -133,7 +159,14 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             anyhow::bail!("Profile '{}' not found", profile_name);
         }
     } else if params.non_interactive {
-        anyhow::bail!("No URI provided and running in non-interactive mode");
+        anyhow::bail!(
+            "No URI provided and running in non-interactive mode.\n\
+            Provide URI via:\n\
+            • --uri flag\n\
+            • MONGODB_URI environment variable\n\
+            • MONGO_URI environment variable\n\
+            • --profile flag"
+        );
     } else {
         get_connection_profile()?
     };
@@ -216,7 +249,10 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             fields: params.fields.map(|s| parse_field_list(s)),
             limit: params.limit,
             skip: params.skip,
-            sort: params.sort.and_then(|s| parse_sort_spec(s).ok()),
+            sort: params
+                .sort
+                .map(|s| parse_sort_spec(s).context("Invalid --sort specification"))
+                .transpose()?,
             validate_fields: true,
             collect_stats: true,
         }
@@ -297,23 +333,13 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         .await
         .context("Failed to count documents")?;
 
-    // Get export method (interactive mode only)
-    let _export_method = if params.non_interactive {
-        // Use mongoexport if available, otherwise native
-        if MongoExportRunner::is_available() {
-            ExportMethod::MongoExport
-        } else {
-            ExportMethod::Native
-        }
-    } else {
-        get_export_method(Some(total_count))?
-    };
-
-    // Get output path
+    // Get output path and validate it
     let output_path = if let Some(path) = params.output {
-        path.clone()
+        // Validate the provided path
+        let validated = validate_output_path(path).context("Invalid output path")?;
+        validated.to_string_lossy().to_string()
     } else if params.non_interactive {
-        format!(
+        let default_path = format!(
             "export.{}",
             match export_format {
                 ExportFormat::JsonLines => "jsonl",
@@ -322,7 +348,10 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
                 ExportFormat::Parquet => "parquet",
                 ExportFormat::Bson => "bson",
             }
-        )
+        );
+        // Validate the default path
+        let validated = validate_output_path(&default_path).context("Invalid output path")?;
+        validated.to_string_lossy().to_string()
     } else {
         get_output_path(&export_format, &compression_type)?
     };
@@ -377,6 +406,7 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         collect_stats: true,
         validate_fields: None, // Let unified system decide
         resume_session_id,
+        total_count_hint: Some(total_count),
         ..Default::default()
     };
 
@@ -389,12 +419,25 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn run_resume_command(session_id: Option<&String>) -> Result<()> {
+async fn run_resume_command(
+    session_id: Option<&String>,
+    cli_uri: Option<&String>,
+) -> Result<()> {
     let resume_manager = ResumableExportManager::new(None)?;
 
     if let Some(session_id) = session_id {
-        // Resume specific session
-        if let Some(checkpoint) = resume_manager.load_session(session_id)? {
+        // Resume specific session. The checkpoint no longer persists the connection URI
+        // (credential leak risk), so we require the user to re-supply it via --uri or env.
+        let uri = get_uri_from_env_or_provided(cli_uri.map(|s| s.as_str())).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Resume requires a MongoDB URI. Provide one via --uri or the \
+                 MONGODB_URI/MONGO_URI environment variable."
+            )
+        })?;
+
+        if let Some(mut checkpoint) = resume_manager.load_session(session_id)? {
+            checkpoint.config.uri = uri.clone();
+
             println!(
                 "{} Resuming export session: {}",
                 style("🔄").cyan(),
@@ -409,8 +452,8 @@ async fn run_resume_command(session_id: Option<&String>) -> Result<()> {
                 checkpoint.progress.percentage_complete, checkpoint.progress.documents_exported
             );
 
-            // Connect to MongoDB using stored config
-            let client = connect_to_mongodb(&checkpoint.config.uri).await?;
+            // Connect to MongoDB using the freshly supplied URI.
+            let client = connect_to_mongodb(&uri).await?;
             let database = client.database(&checkpoint.config.database);
             let collection = database.collection(&checkpoint.config.collection);
 

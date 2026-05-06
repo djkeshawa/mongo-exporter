@@ -36,6 +36,11 @@ pub struct ExportCheckpoint {
 /// Export configuration for resumable exports
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfig {
+    /// MongoDB connection URI. Held in memory only — `#[serde(skip)]` ensures it never
+    /// hits disk, since checkpoints would otherwise persist plaintext credentials in a
+    /// world-readable cache directory. On resume, the caller must repopulate this from
+    /// `--uri` / env before reconnecting.
+    #[serde(skip, default)]
     pub uri: String,
     pub database: String,
     pub collection: String,
@@ -130,6 +135,24 @@ impl Default for CheckpointStats {
     }
 }
 
+/// Reject session IDs that could be used to escape the checkpoint directory or otherwise
+/// confuse the filesystem layer. Mirrors the alphabet used by `generate_session_id`.
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        anyhow::bail!("Session ID cannot be empty");
+    }
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!(
+            "Invalid session ID '{}': only alphanumerics, '-', and '_' are allowed",
+            session_id
+        );
+    }
+    Ok(())
+}
+
 /// Manager for resumable exports
 pub struct ResumableExportManager {
     checkpoint_dir: PathBuf,
@@ -187,6 +210,7 @@ impl ResumableExportManager {
 
     /// Load an existing export session
     pub fn load_session(&self, session_id: &str) -> Result<Option<ExportCheckpoint>> {
+        validate_session_id(session_id)?;
         let checkpoint_path = self.get_checkpoint_path(session_id);
 
         if !checkpoint_path.exists() {
@@ -256,6 +280,17 @@ impl ResumableExportManager {
             )
         })?;
 
+        // Restrict to owner-only on Unix. Checkpoints carry filter and field information that
+        // can be sensitive; until we drop more credentials/PII this is cheap defense in depth.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                &checkpoint_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
         // Clean up old checkpoints
         self.cleanup_old_checkpoints()?;
 
@@ -309,24 +344,44 @@ impl ResumableExportManager {
         Ok(())
     }
 
-    /// Check if enough time has passed for next checkpoint
+    /// Check if enough time has passed for next checkpoint.
+    ///
+    /// Uses an absolute-value comparison so a backward clock adjustment (NTP, DST) doesn't
+    /// suppress checkpointing indefinitely. We treat any "anomalous" gap (negative or larger
+    /// than 24h) as a signal to checkpoint immediately.
     pub fn should_checkpoint(&self, last_checkpoint: DateTime<Utc>) -> bool {
-        let elapsed = Utc::now().signed_duration_since(last_checkpoint);
-        elapsed.num_seconds() >= self.checkpoint_interval.as_secs() as i64
+        let elapsed = Utc::now()
+            .signed_duration_since(last_checkpoint)
+            .num_seconds();
+        let interval = self.checkpoint_interval.as_secs() as i64;
+        elapsed < 0 || elapsed >= interval
     }
 
-    /// Generate unique session ID
+    /// Generate a unique session ID.
+    ///
+    /// Uses high-resolution time + a random suffix so the result is stable across Rust
+    /// compiler versions (`std::collections::hash_map::DefaultHasher` is not). Includes a
+    /// short namespace based on database/collection so manual inspection of checkpoint
+    /// filenames is at least somewhat human-readable.
     fn generate_session_id(&self, config: &ExportConfig) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        config.database.hash(&mut hasher);
-        config.collection.hash(&mut hasher);
-        config.output_path.hash(&mut hasher);
-        SystemTime::now().hash(&mut hasher);
-
-        format!("{:x}", hasher.finish())
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let suffix: u64 = rand::random();
+        let safe_db: String = config
+            .database
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(16)
+            .collect();
+        let safe_coll: String = config
+            .collection
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(16)
+            .collect();
+        format!("{}-{}-{:x}-{:x}", safe_db, safe_coll, nanos, suffix)
     }
 
     /// Get checkpoint file path for session
@@ -382,11 +437,9 @@ impl ResumableExportManager {
     /// Resume export from checkpoint
     pub fn resume_from_checkpoint(&self, checkpoint: &ExportCheckpoint) -> Result<ResumeInfo> {
         let resume_info = ResumeInfo {
-            session_id: checkpoint.session_id.clone(),
             resume_filter: self.build_resume_filter(checkpoint)?,
             output_mode: self.determine_output_mode(checkpoint)?,
             progress_offset: checkpoint.progress.documents_exported,
-            bytes_offset: checkpoint.progress.bytes_written,
         };
 
         println!(
@@ -437,10 +490,16 @@ impl ResumableExportManager {
                 let operator = if direction >= 0 { "$gt" } else { "$lt" };
                 base_filter.insert(field, doc! {operator: last_value});
             }
+        } else if let Some(last_id) = last_sort_key.get("_id") {
+            // For multi-field sorts, fall back to _id-based resume only if we actually
+            // captured the _id of the last processed document. Inserting an Option<&Bson>
+            // directly would serialize the enum wrapper and produce a filter that matches
+            // nothing, silently breaking resume.
+            base_filter.insert("_id", doc! {"$gt": last_id});
         } else {
-            // For multi-field sorts, use a more complex $or condition
-            // This is simplified - production would need full sort key comparison
-            base_filter.insert("_id", doc! {"$gt": last_sort_key.get("_id")});
+            anyhow::bail!(
+                "Cannot resume sorted export: no _id captured in cursor state for multi-field sort"
+            );
         }
 
         Ok(base_filter)
@@ -468,13 +527,9 @@ impl ResumableExportManager {
 /// Information needed to resume an export
 #[derive(Debug)]
 pub struct ResumeInfo {
-    #[allow(dead_code)]
-    pub session_id: String,
     pub resume_filter: Document,
     pub output_mode: OutputMode,
     pub progress_offset: u64,
-    #[allow(dead_code)]
-    pub bytes_offset: u64,
 }
 
 /// How to handle the output file during resume

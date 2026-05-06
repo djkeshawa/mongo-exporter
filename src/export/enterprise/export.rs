@@ -3,8 +3,7 @@ use console::style;
 use futures::stream::StreamExt;
 use mongodb::{bson::Document, options::FindOptions, Collection};
 use std::{
-    fs::File,
-    io::{BufWriter, Write},
+    io::Write,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -21,7 +20,9 @@ use std::sync::Arc as ArrowArc;
 
 use crate::config::PerformanceConfig;
 use crate::types::{CompressionType, ExportFormat};
-use crate::utils::{collect_field_names, get_field_value};
+use crate::utils::{
+    collect_field_names, create_buffered_writer, document_to_json_value, get_field_value,
+};
 
 /// Enterprise export options
 #[derive(Debug, Clone)]
@@ -109,6 +110,9 @@ impl EnterpriseExporter {
         if let Some(ref sort) = options.sort {
             find_options.sort = Some(sort.clone());
         }
+        // Disable the server-side 10-minute idle cursor timeout: large exports trivially exceed
+        // it, and getting a CursorNotFound mid-stream leaves the output file inconsistent.
+        find_options.no_cursor_timeout = Some(true);
 
         // Project fields if specified
         if let Some(ref fields) = options.fields {
@@ -264,11 +268,8 @@ impl EnterpriseExporter {
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
-
-        let writer = self.create_writer(file, compression)?;
-        let mut writer = writer;
+        let mut writer =
+            create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
         let mut cursor = collection
             .find(filter.clone(), find_options.clone())
@@ -283,7 +284,7 @@ impl EnterpriseExporter {
                 Ok(document) => {
                     stats.documents_processed += 1;
 
-                    let json_str = serde_json::to_string(&document)
+                    let json_str = serde_json::to_string(&document_to_json_value(&document))
                         .context("Failed to serialize document to JSON")?;
 
                     buffer.push_str(&json_str);
@@ -301,7 +302,6 @@ impl EnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -332,11 +332,8 @@ impl EnterpriseExporter {
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
-
-        let writer = self.create_writer(file, compression)?;
-        let mut writer = writer;
+        let mut writer =
+            create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
         writer
             .write_all(b"[\n")
@@ -371,7 +368,6 @@ impl EnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -405,10 +401,8 @@ impl EnterpriseExporter {
     ) -> Result<()> {
         use csv::Writer;
 
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
-
-        let writer = self.create_writer(file, compression)?;
+        let writer =
+            create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
         let mut csv_writer = Writer::from_writer(writer);
 
         // Determine fields to export
@@ -454,7 +448,6 @@ impl EnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -480,7 +473,7 @@ impl EnterpriseExporter {
             }
 
             // Serialize document to pretty JSON
-            let json_str = serde_json::to_string_pretty(document)
+            let json_str = serde_json::to_string_pretty(&document_to_json_value(document))
                 .context("Failed to serialize document to JSON")?;
 
             // Add indentation to each line
@@ -521,11 +514,8 @@ impl EnterpriseExporter {
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
-
-        let writer = self.create_writer(file, compression)?;
-        let mut writer = writer;
+        let mut writer =
+            create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
         let mut cursor = collection
             .find(filter.clone(), find_options.clone())
@@ -552,7 +542,6 @@ impl EnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -616,7 +605,9 @@ impl EnterpriseExporter {
             .await
             .context("Failed to execute query")?;
 
-        let batch_size = self.config.batch_flush_threshold / 1024; // Reasonable batch size for Parquet
+        // Parquet row groups need many rows (tens of thousands) to compress well — use the
+        // document batch size directly, with a sensible floor.
+        let batch_size = self.config.document_batch_size.max(1024);
         let mut batch_data: Vec<Vec<Option<String>>> = vec![Vec::new(); fields.len()];
         let mut local_count = 0u64;
 
@@ -652,7 +643,6 @@ impl EnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -706,71 +696,48 @@ impl EnterpriseExporter {
         )
         .await
     }
-
-    fn create_writer(
-        &self,
-        file: File,
-        compression: &CompressionType,
-    ) -> Result<Box<dyn Write + Send>> {
-        let writer: Box<dyn Write + Send> = match compression {
-            CompressionType::None => Box::new(BufWriter::with_capacity(
-                self.config.write_buffer_size,
-                file,
-            )),
-            CompressionType::Gzip => {
-                use flate2::{write::GzEncoder, Compression};
-                let gz_encoder = GzEncoder::new(file, Compression::default());
-                Box::new(BufWriter::with_capacity(
-                    self.config.write_buffer_size,
-                    gz_encoder,
-                ))
-            }
-        };
-
-        Ok(writer)
-    }
 }
 
 /// Print detailed export statistics
 pub fn print_export_stats(stats: &ExportStats) {
     println!();
     println!("{}", style("📊 Export Statistics").cyan().bold());
-    println!("┌{}┐", "─".repeat(50));
+    println!("┌{}┐", "─".repeat(56));
     println!(
-        "│ {:<30} {:>15} │",
+        "│ {:<30} {:>22} │",
         "Documents processed:", stats.documents_processed
     );
     println!(
-        "│ {:<30} {:>15} │",
+        "│ {:<30} {:>22} │",
         "Documents exported:", stats.documents_exported
     );
 
     if stats.documents_skipped > 0 {
         println!(
-            "│ {:<30} {:>15} │",
+            "│ {:<30} {:>22} │",
             "Documents skipped:", stats.documents_skipped
         );
     }
 
     if stats.fields_discovered > 0 {
         println!(
-            "│ {:<30} {:>15} │",
+            "│ {:<30} {:>22} │",
             "Fields discovered:", stats.fields_discovered
         );
     }
 
     println!(
-        "│ {:<30} {:>15} │",
+        "│ {:<30} {:>22} │",
         "Bytes written:",
         format_bytes(stats.bytes_written)
     );
     println!(
-        "│ {:<30} {:>15} │",
+        "│ {:<30} {:>22} │",
         "Processing time:",
         format!("{}ms", stats.processing_time_ms)
     );
     println!(
-        "│ {:<30} {:>15} │",
+        "│ {:<30} {:>22} │",
         "Peak memory:",
         format_bytes(stats.memory_peak_bytes as u64)
     );
@@ -779,17 +746,17 @@ pub fn print_export_stats(stats: &ExportStats) {
         let docs_per_sec =
             (stats.documents_exported as f64 * 1000.0) / stats.processing_time_ms as f64;
         println!(
-            "│ {:<30} {:>15} │",
+            "│ {:<30} {:>22} │",
             "Throughput:",
             format!("{:.0} docs/sec", docs_per_sec)
         );
     }
 
     if !stats.errors.is_empty() {
-        println!("│ {:<30} {:>15} │", "Errors:", stats.errors.len());
+        println!("│ {:<30} {:>22} │", "Errors:", stats.errors.len());
     }
 
-    println!("└{}┘", "─".repeat(50));
+    println!("└{}┘", "─".repeat(56));
 
     // Show errors if any
     if !stats.errors.is_empty() {

@@ -3,8 +3,7 @@ use console::style;
 use futures::stream::StreamExt;
 use mongodb::{bson::Document, options::FindOptions, Collection};
 use std::{
-    fs::File,
-    io::{BufWriter, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -17,18 +16,27 @@ use crate::export::enterprise::export::{ExportOptions, ExportStats};
 use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::formats::json_optimizer::JsonOptimizer;
 use crate::export::resumable::{
-    CheckpointStats, CursorState, ExportCheckpoint, ExportConfig, ExportProgress, OutputMode,
+    CheckpointStats, ExportCheckpoint, ExportConfig, ExportProgress, OutputMode,
     ResumableExportManager, ResumeInfo,
 };
 use crate::types::{CompressionType, ExportFormat};
-use crate::utils::error_handling::{
-    display_error_statistics, AdvancedErrorHandler, ErrorHandlingConfig,
-};
+use crate::utils::error_handling::ErrorHandlingConfig;
+use crate::utils::{document_to_json_value, wrap_writer_with_compression};
+
+/// Parameters for optimized export
+struct OptimizedExportParams<'a> {
+    collection: &'a Collection<Document>,
+    filter: &'a Document,
+    output_path: &'a str,
+    format: &'a ExportFormat,
+    compression: &'a CompressionType,
+    exported_count: Arc<AtomicU64>,
+    find_options: Option<FindOptions>,
+}
 
 /// Enhanced enterprise exporter with resumable exports and advanced error handling
 pub struct EnhancedEnterpriseExporter {
     performance_config: PerformanceConfig,
-    error_handler: AdvancedErrorHandler,
     resume_manager: ResumableExportManager,
     start_time: Instant,
 }
@@ -36,16 +44,13 @@ pub struct EnhancedEnterpriseExporter {
 impl EnhancedEnterpriseExporter {
     pub fn new(
         performance_config: PerformanceConfig,
-        error_config: Option<ErrorHandlingConfig>,
+        _error_config: Option<ErrorHandlingConfig>,
         checkpoint_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        let error_handler = AdvancedErrorHandler::new(error_config.unwrap_or_default());
-
         let resume_manager = ResumableExportManager::new(checkpoint_dir)?;
 
         Ok(Self {
             performance_config,
-            error_handler,
             resume_manager,
             start_time: Instant::now(),
         })
@@ -112,33 +117,23 @@ impl EnhancedEnterpriseExporter {
             self.resume_manager.create_session(export_config)?
         };
 
-        // Execute export with error handling and resumability
+        // Execute export. We deliberately do NOT wrap this in execute_with_retry: a resumable
+        // export already has restart semantics via the checkpoint, and retrying the entire
+        // pipeline from scratch would re-truncate the output file.
         let result = self
-            .error_handler
-            .execute_with_retry(|| {
-                self.execute_resumable_export(
-                    collection,
-                    &checkpoint,
-                    resume_info.as_ref(),
-                    options,
-                    exported_count.clone(),
-                )
-            })
+            .execute_resumable_export(
+                collection,
+                &mut checkpoint,
+                resume_info.as_ref(),
+                options,
+                exported_count.clone(),
+            )
             .await;
 
         match result {
             Ok(stats) => {
-                // Export completed successfully
                 self.resume_manager
                     .complete_export(&checkpoint.session_id)?;
-
-                // Display error statistics if any occurred
-                let error_stats = self.error_handler.get_statistics();
-                if error_stats.total_retries > 0 {
-                    println!();
-                    display_error_statistics(&error_stats);
-                }
-
                 Ok(stats)
             }
             Err(error) => {
@@ -153,10 +148,6 @@ impl EnhancedEnterpriseExporter {
                 );
                 println!("Resume with: --resume {}", checkpoint.session_id);
 
-                // Display error statistics
-                let error_stats = self.error_handler.get_statistics();
-                display_error_statistics(&error_stats);
-
                 Err(error)
             }
         }
@@ -166,7 +157,7 @@ impl EnhancedEnterpriseExporter {
     async fn execute_resumable_export(
         &self,
         collection: &Collection<Document>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         resume_info: Option<&ResumeInfo>,
         options: &ExportOptions,
         exported_count: Arc<AtomicU64>,
@@ -179,6 +170,20 @@ impl EnhancedEnterpriseExporter {
             // Resuming export
             println!("🔄 Resuming export from checkpoint...");
 
+            // Gzip resume is intrinsically unsafe today: bytes_written counts uncompressed
+            // bytes while the on-disk file is compressed, so the size comparison in
+            // determine_output_mode falls through to Recreate — silently dropping previously
+            // exported rows. And even if we appended, concatenated gzip streams aren't read
+            // correctly by Python's gzip / Java's GZIPInputStream / many analytics tools.
+            // Refuse loudly until we can track compressed bytes and emit a single stream.
+            if matches!(checkpoint.config.compression, CompressionType::Gzip) {
+                anyhow::bail!(
+                    "Gzip-compressed exports cannot be safely resumed (would silently truncate \
+                     or produce a multi-stream file rejected by some readers). Re-run from \
+                     scratch (omit --resume) or export without --compression gzip."
+                );
+            }
+
             let find_options = self.build_resume_find_options(&checkpoint.config, resume_info)?;
             let writer = self.setup_resume_output(&checkpoint.config, resume_info)?;
 
@@ -186,16 +191,20 @@ impl EnhancedEnterpriseExporter {
         } else {
             // New export - check if we can use optimized versions
             if self.performance_config.enable_parallel_processing && resume_info.is_none() {
+                // Build find options for the optimized export
+                let find_options = self.build_find_options(&checkpoint.config)?;
+
                 // Use optimized versions for new exports when parallel processing is enabled
                 return self
-                    .execute_optimized_export(
+                    .execute_optimized_export(OptimizedExportParams {
                         collection,
-                        &checkpoint.config.filter,
-                        &checkpoint.config.output_path,
-                        &checkpoint.config.format,
-                        &checkpoint.config.compression,
+                        filter: &checkpoint.config.filter,
+                        output_path: &checkpoint.config.output_path,
+                        format: &checkpoint.config.format,
+                        compression: &checkpoint.config.compression,
                         exported_count,
-                    )
+                        find_options: Some(find_options),
+                    })
                     .await;
             }
 
@@ -205,8 +214,26 @@ impl EnhancedEnterpriseExporter {
             (checkpoint.config.filter.clone(), find_options, writer)
         };
 
+        // CSV needs field discovery up front; cache the schema on the checkpoint so a resume
+        // sees the same columns as the original run (otherwise we'd silently corrupt the file).
+        if matches!(checkpoint.config.format, ExportFormat::Csv)
+            && checkpoint.config.fields.is_none()
+            && options.fields.is_none()
+        {
+            let discovered = crate::utils::discover_csv_fields(
+                collection,
+                &checkpoint.config.filter,
+                self.performance_config.csv_field_sample_size,
+                None,
+            )
+            .await?;
+            checkpoint.config.fields = Some(discovered);
+            self.resume_manager.save_checkpoint(checkpoint)?;
+        }
+
         // Execute format-specific export
-        match &checkpoint.config.format {
+        let format = checkpoint.config.format.clone();
+        match format {
             ExportFormat::JsonLines => {
                 self.export_jsonl_resumable(
                     collection,
@@ -226,6 +253,7 @@ impl EnhancedEnterpriseExporter {
                     &find_options,
                     output_writer,
                     checkpoint,
+                    resume_info.is_some(),
                     exported_count.clone(),
                     &mut stats,
                 )
@@ -257,11 +285,19 @@ impl EnhancedEnterpriseExporter {
                 .await?;
             }
             ExportFormat::Parquet => {
+                if resume_info.is_some() {
+                    anyhow::bail!(
+                        "Parquet exports cannot be resumed: the format writes its row-group \
+                         index in a footer at the end of the file, so partial files are not \
+                         appendable. Re-run the export from scratch (omit --resume) or choose \
+                         JSONL/CSV/BSON for a resumable export."
+                    );
+                }
+                drop(output_writer); // unused: parquet manages its own File handle
                 self.export_parquet_resumable(
                     collection,
                     &query_filter,
                     &find_options,
-                    output_writer,
                     checkpoint,
                     options,
                     exported_count.clone(),
@@ -281,28 +317,24 @@ impl EnhancedEnterpriseExporter {
     /// Execute optimized export for new exports when parallel processing is enabled
     async fn execute_optimized_export(
         &self,
-        collection: &Collection<Document>,
-        filter: &Document,
-        output_path: &str,
-        format: &ExportFormat,
-        compression: &CompressionType,
-        exported_count: Arc<AtomicU64>,
+        params: OptimizedExportParams<'_>,
     ) -> Result<ExportStats> {
         let start_time = Instant::now();
         let mut stats = ExportStats::default();
 
-        println!("⚡ Using optimized parallel export for {}", format);
+        println!("⚡ Using optimized parallel export for {}", params.format);
 
-        match format {
+        match params.format {
             ExportFormat::JsonLines => {
                 let optimizer = JsonOptimizer::new(self.performance_config.clone());
                 optimizer
                     .export_json_lines_parallel(
-                        collection,
-                        filter,
-                        output_path,
-                        compression,
-                        exported_count.clone(),
+                        params.collection,
+                        params.filter,
+                        params.output_path,
+                        params.compression,
+                        params.exported_count.clone(),
+                        params.find_options,
                     )
                     .await?;
             }
@@ -310,11 +342,12 @@ impl EnhancedEnterpriseExporter {
                 let optimizer = JsonOptimizer::new(self.performance_config.clone());
                 optimizer
                     .export_json_array_parallel(
-                        collection,
-                        filter,
-                        output_path,
-                        compression,
-                        exported_count.clone(),
+                        params.collection,
+                        params.filter,
+                        params.output_path,
+                        params.compression,
+                        params.exported_count.clone(),
+                        params.find_options,
                     )
                     .await?;
             }
@@ -322,11 +355,12 @@ impl EnhancedEnterpriseExporter {
                 let optimizer = CsvOptimizer::new(self.performance_config.clone());
                 optimizer
                     .export_csv_streaming(
-                        collection,
-                        filter,
-                        output_path,
-                        compression,
-                        exported_count.clone(),
+                        params.collection,
+                        params.filter,
+                        params.output_path,
+                        params.compression,
+                        params.exported_count.clone(),
+                        params.find_options,
                     )
                     .await?;
             }
@@ -344,7 +378,7 @@ impl EnhancedEnterpriseExporter {
 
         // Finalize stats
         stats.processing_time_ms = start_time.elapsed().as_millis() as u64;
-        stats.documents_exported = exported_count.load(Ordering::Relaxed);
+        stats.documents_exported = params.exported_count.load(Ordering::Relaxed);
 
         Ok(stats)
     }
@@ -367,6 +401,9 @@ impl EnhancedEnterpriseExporter {
 
         // Set batch size based on performance config
         find_options.batch_size = Some(self.performance_config.document_batch_size as u32);
+        // Disable the server-side 10-minute idle cursor timeout: large exports trivially exceed
+        // it, and getting a CursorNotFound mid-stream leaves the output file inconsistent.
+        find_options.no_cursor_timeout = Some(true);
 
         Ok(find_options)
     }
@@ -390,10 +427,11 @@ impl EnhancedEnterpriseExporter {
 
     /// Setup output writer for new export
     fn setup_new_output(&self, config: &ExportConfig) -> Result<Box<dyn Write + Send>> {
-        let file = File::create(&config.output_path)
-            .with_context(|| format!("Failed to create output file: {}", config.output_path))?;
-
-        self.create_buffered_writer(file, &config.compression)
+        crate::utils::create_buffered_writer(
+            &config.output_path,
+            &config.compression,
+            self.performance_config.write_buffer_size,
+        )
     }
 
     /// Setup output writer for resuming export
@@ -418,37 +456,14 @@ impl EnhancedEnterpriseExporter {
                             config.output_path
                         )
                     })?;
-
-                // Seek to end for append mode
                 file.seek(SeekFrom::End(0))?;
-
-                self.create_buffered_writer(file, &config.compression)
-            }
-        }
-    }
-
-    /// Create buffered writer with compression
-    fn create_buffered_writer(
-        &self,
-        file: File,
-        compression: &CompressionType,
-    ) -> Result<Box<dyn Write + Send>> {
-        let writer: Box<dyn Write + Send> = match compression {
-            CompressionType::None => Box::new(BufWriter::with_capacity(
-                self.performance_config.write_buffer_size,
-                file,
-            )),
-            CompressionType::Gzip => {
-                use flate2::{write::GzEncoder, Compression};
-                let gz_encoder = GzEncoder::new(file, Compression::default());
-                Box::new(BufWriter::with_capacity(
+                Ok(wrap_writer_with_compression(
+                    file,
+                    &config.compression,
                     self.performance_config.write_buffer_size,
-                    gz_encoder,
                 ))
             }
-        };
-
-        Ok(writer)
+        }
     }
 
     /// Export JSON Lines with resumable checkpointing
@@ -459,7 +474,7 @@ impl EnhancedEnterpriseExporter {
         filter: &Document,
         find_options: &FindOptions,
         mut writer: Box<dyn Write + Send>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
@@ -470,14 +485,13 @@ impl EnhancedEnterpriseExporter {
 
         let mut buffer = String::with_capacity(self.performance_config.string_buffer_size);
         let mut local_count = 0u64;
-        let mut _checkpoint_timer = Instant::now();
 
         while let Some(result) = cursor.next().await {
             match result {
                 Ok(document) => {
                     stats.documents_processed += 1;
 
-                    let json_str = serde_json::to_string(&document)
+                    let json_str = serde_json::to_string(&document_to_json_value(&document))
                         .context("Failed to serialize document to JSON")?;
 
                     buffer.push_str(&json_str);
@@ -494,19 +508,18 @@ impl EnhancedEnterpriseExporter {
 
                         exported_count.store(local_count, Ordering::Relaxed);
 
-                        // Checkpoint periodically
+                        // Checkpoint periodically. save_progress_checkpoint advances
+                        // checkpoint.last_checkpoint, so the next call won't fire immediately.
                         if self
                             .resume_manager
                             .should_checkpoint(checkpoint.last_checkpoint)
                         {
                             self.save_progress_checkpoint(checkpoint, local_count, stats)?;
-                            _checkpoint_timer = Instant::now();
                         }
                     }
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -525,7 +538,12 @@ impl EnhancedEnterpriseExporter {
         Ok(())
     }
 
-    /// Export JSON Array with resumable checkpointing (simplified implementation)
+    /// Export JSON Array with resumable checkpointing.
+    ///
+    /// Resuming a JSON Array file is intrinsically tricky: a previous run wrote `[\n` and
+    /// some elements but never the closing `]`. On resume we open in append mode and continue
+    /// emitting `,\n<element>` pairs, finally writing the closing `]` exactly once when the
+    /// cursor drains.
     #[allow(clippy::too_many_arguments)]
     async fn export_json_array_resumable(
         &self,
@@ -533,14 +551,13 @@ impl EnhancedEnterpriseExporter {
         filter: &Document,
         find_options: &FindOptions,
         mut writer: Box<dyn Write + Send>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
+        is_resuming: bool,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-        // Note: JSON Array resuming is more complex due to array structure
-        // This is a simplified implementation - production would need special handling
-
-        if checkpoint.progress.documents_exported == 0 {
+        // Only emit the opening bracket on a fresh export. On resume the file already starts with `[`.
+        if !is_resuming {
             writer
                 .write_all(b"[\n")
                 .context("Failed to write array start")?;
@@ -552,11 +569,12 @@ impl EnhancedEnterpriseExporter {
             .context("Failed to execute query")?;
 
         let mut local_count = checkpoint.progress.documents_exported;
-        let first_in_resume = checkpoint.progress.documents_exported == 0;
 
-        // Use batching to reduce memory pressure while maintaining checkpoint functionality
+        // Need a comma prefix if there are already documents in the file (i.e., we're resuming
+        // after some elements were written, or this is not the first document of a new file).
+        let mut batch_needs_comma = is_resuming && checkpoint.progress.documents_exported > 0;
+
         let mut document_batch = Vec::with_capacity(self.performance_config.document_batch_size);
-        let mut batch_needs_comma = !first_in_resume;
 
         while let Some(result) = cursor.next().await {
             match result {
@@ -564,7 +582,6 @@ impl EnhancedEnterpriseExporter {
                     stats.documents_processed += 1;
                     document_batch.push(document);
 
-                    // Process batch when full or should checkpoint
                     let should_checkpoint = self
                         .resume_manager
                         .should_checkpoint(checkpoint.last_checkpoint);
@@ -572,7 +589,6 @@ impl EnhancedEnterpriseExporter {
                     if document_batch.len() >= self.performance_config.document_batch_size
                         || should_checkpoint
                     {
-                        // Write the batch
                         self.write_json_array_batch_resumable(
                             &mut writer,
                             &document_batch,
@@ -582,30 +598,30 @@ impl EnhancedEnterpriseExporter {
                         local_count += document_batch.len() as u64;
                         exported_count.store(local_count, Ordering::Relaxed);
 
-                        // After first batch, always need commas
                         batch_needs_comma = true;
                         document_batch.clear();
 
-                        // Checkpoint if needed
                         if should_checkpoint {
+                            writer
+                                .flush()
+                                .context("Failed to flush before checkpoint")?;
                             self.save_progress_checkpoint(checkpoint, local_count, stats)?;
                         }
                     }
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
 
-        // Process remaining documents in final batch
         if !document_batch.is_empty() {
             self.write_json_array_batch_resumable(&mut writer, &document_batch, batch_needs_comma)?;
             local_count += document_batch.len() as u64;
             exported_count.store(local_count, Ordering::Relaxed);
         }
 
+        // Closing bracket goes only once, at successful completion.
         writer
             .write_all(b"\n]\n")
             .context("Failed to write array end")?;
@@ -614,7 +630,11 @@ impl EnhancedEnterpriseExporter {
         Ok(())
     }
 
-    /// Export CSV with resumable checkpointing (simplified implementation)
+    /// Export CSV with resumable checkpointing.
+    ///
+    /// Field schema is sourced (in priority order) from the explicit options, the cached
+    /// schema on the checkpoint config (set by the caller via `discover_csv_fields` before
+    /// dispatch), or as a last resort from a fresh discovery pass.
     #[allow(clippy::too_many_arguments)]
     async fn export_csv_resumable(
         &self,
@@ -622,7 +642,7 @@ impl EnhancedEnterpriseExporter {
         filter: &Document,
         find_options: &FindOptions,
         writer: Box<dyn Write + Send>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         options: &ExportOptions,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
@@ -631,16 +651,17 @@ impl EnhancedEnterpriseExporter {
 
         let mut csv_writer = Writer::from_writer(writer);
 
-        // For CSV, we need to handle headers specially during resume
-        let fields = if let Some(ref specified_fields) = options.fields {
-            specified_fields.clone()
+        let fields: Vec<String> = if let Some(ref specified) = options.fields {
+            specified.clone()
+        } else if let Some(ref cached) = checkpoint.config.fields {
+            cached.clone()
         } else {
-            // Field discovery would need to be cached/resumed properly
-            // This is simplified for demonstration
-            vec!["_id".to_string(), "data".to_string()]
+            anyhow::bail!(
+                "CSV resumable export requires a known field schema; none was provided or discovered"
+            );
         };
 
-        // Write header only if starting new export
+        // Write header only if starting a new export
         if checkpoint.progress.documents_exported == 0 {
             csv_writer
                 .write_record(&fields)
@@ -671,7 +692,6 @@ impl EnhancedEnterpriseExporter {
                     local_count += 1;
                     exported_count.store(local_count, Ordering::Relaxed);
 
-                    // Checkpoint periodically
                     if self
                         .resume_manager
                         .should_checkpoint(checkpoint.last_checkpoint)
@@ -682,7 +702,6 @@ impl EnhancedEnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -699,7 +718,7 @@ impl EnhancedEnterpriseExporter {
         filter: &Document,
         find_options: &FindOptions,
         mut writer: Box<dyn Write + Send>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
@@ -737,7 +756,6 @@ impl EnhancedEnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -746,15 +764,16 @@ impl EnhancedEnterpriseExporter {
         Ok(())
     }
 
-    /// Export documents in Parquet format with resumable support
+    /// Export documents in Parquet format. Not actually resumable: Parquet's row-group index
+    /// lives in the footer, so we don't support appending to an existing file. Resume callers
+    /// are rejected upstream.
     #[allow(clippy::too_many_arguments)]
     async fn export_parquet_resumable(
         &self,
         collection: &Collection<Document>,
         filter: &Document,
         find_options: &FindOptions,
-        _writer: Box<dyn Write + Send>,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         _options: &ExportOptions,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
@@ -768,12 +787,14 @@ impl EnhancedEnterpriseExporter {
         let output_path = &checkpoint.config.output_path;
         let compression = &checkpoint.config.compression;
 
-        // First pass: discover schema by sampling documents
+        // First pass: discover schema by sampling documents. Pass the caller's find_options so
+        // the user's --limit and --skip bound the discovery scan; previously this passed None
+        // and could over-scan beyond what would actually be exported.
         let fields = crate::utils::discover_csv_fields(
             collection,
             filter,
             self.performance_config.csv_field_sample_size,
-            None,
+            Some(find_options),
         )
         .await?;
 
@@ -815,7 +836,7 @@ impl EnhancedEnterpriseExporter {
             .context("Failed to execute MongoDB query")?;
 
         let mut local_count = 0u64;
-        let batch_size = self.performance_config.document_batch_size;
+        let batch_size = self.performance_config.document_batch_size.max(1024);
         let mut document_batch = Vec::with_capacity(batch_size);
 
         while let Some(result) = cursor.next().await {
@@ -840,7 +861,6 @@ impl EnhancedEnterpriseExporter {
                 }
                 Err(e) => {
                     stats.errors.push(format!("Document read error: {}", e));
-                    continue;
                 }
             }
         }
@@ -928,7 +948,7 @@ impl EnhancedEnterpriseExporter {
             }
 
             // Serialize document to pretty JSON
-            let json_str = serde_json::to_string_pretty(document)
+            let json_str = serde_json::to_string_pretty(&document_to_json_value(document))
                 .context("Failed to serialize document to JSON")?;
 
             // Add indentation to each line
@@ -957,10 +977,12 @@ impl EnhancedEnterpriseExporter {
         Ok(())
     }
 
-    /// Save progress checkpoint
+    /// Save progress checkpoint. Updates the caller's checkpoint in place — in particular,
+    /// `last_checkpoint` is advanced to "now", which is what gates `should_checkpoint` from
+    /// firing on every batch after the first 30s window.
     fn save_progress_checkpoint(
         &self,
-        checkpoint: &ExportCheckpoint,
+        checkpoint: &mut ExportCheckpoint,
         exported_count: u64,
         stats: &ExportStats,
     ) -> Result<()> {
@@ -969,28 +991,27 @@ impl EnhancedEnterpriseExporter {
             documents_exported: exported_count,
             documents_failed: stats.errors.len() as u64,
             bytes_written: stats.bytes_written,
-            percentage_complete: 0.0, // Would calculate based on total
+            percentage_complete: 0.0,
             eta_seconds: None,
         };
 
-        let cursor_state = CursorState::default(); // Would track actual cursor position
+        let cursor_state = checkpoint.cursor_state.clone();
 
         let checkpoint_stats = CheckpointStats {
-            processing_rate: exported_count as f64 / self.start_time.elapsed().as_secs_f64(),
+            processing_rate: exported_count as f64
+                / self.start_time.elapsed().as_secs_f64().max(0.001),
             avg_document_size: if exported_count > 0 {
                 stats.bytes_written as f64 / exported_count as f64
             } else {
                 0.0
             },
-            peak_memory_bytes: 0, // Would track actual memory
+            peak_memory_bytes: 0,
             error_count: stats.errors.len() as u32,
             last_successful_batch: chrono::Utc::now(),
         };
 
-        // Create mutable checkpoint for updating
-        let mut updated_checkpoint = checkpoint.clone();
         self.resume_manager.update_checkpoint(
-            &mut updated_checkpoint,
+            checkpoint,
             progress,
             cursor_state,
             checkpoint_stats,

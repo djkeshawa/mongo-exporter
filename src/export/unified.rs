@@ -20,7 +20,7 @@ use crate::export::formats::csv_optimizer::CsvOptimizer;
 use crate::export::formats::json_optimizer::JsonOptimizer;
 use crate::export::resumable::ResumableExportManager;
 use crate::types::{CompressionType, ExportFormat};
-use crate::utils::error_handling::{AdvancedErrorHandler, ErrorHandlingConfig};
+use crate::utils::error_handling::ErrorHandlingConfig;
 
 /// Unified export options combining all features
 #[derive(Debug, Clone)]
@@ -50,6 +50,9 @@ pub struct UnifiedExportOptions {
 
     // Resume session ID for continuing interrupted exports
     pub resume_session_id: Option<String>,
+
+    // Optional pre-computed document count to avoid an extra MongoDB round-trip
+    pub total_count_hint: Option<u64>,
 }
 
 impl Default for UnifiedExportOptions {
@@ -71,6 +74,7 @@ impl Default for UnifiedExportOptions {
             collect_stats: true,
             validate_fields: None,
             resume_session_id: None,
+            total_count_hint: None,
         }
     }
 }
@@ -101,10 +105,14 @@ enum ExportStrategy {
     Resumable,  // Checkpoint-based for large exports
 }
 
-/// Unified exporter combining the best of all modes
+/// Unified exporter combining the best of all modes.
+///
+/// `error_config` is accepted for forward compatibility but not currently consumed here —
+/// the retry/circuit-breaker plumbing lives at the connection layer (see
+/// `database::connect_to_mongodb_with_retry`) and at format-level error reporting via
+/// per-document error vectors in `ExportStats`.
 pub struct UnifiedExporter {
     performance_config: PerformanceConfig,
-    error_handler: AdvancedErrorHandler,
     resume_manager: ResumableExportManager,
     collection: Collection<Document>,
 }
@@ -113,15 +121,13 @@ impl UnifiedExporter {
     pub fn new(
         collection: Collection<Document>,
         performance_config: Option<PerformanceConfig>,
-        error_config: Option<ErrorHandlingConfig>,
+        _error_config: Option<ErrorHandlingConfig>,
     ) -> Result<Self> {
         let performance_config = performance_config.unwrap_or_default();
-        let error_handler = AdvancedErrorHandler::new(error_config.unwrap_or_default());
         let resume_manager = ResumableExportManager::new(None)?;
 
         Ok(Self {
             performance_config,
-            error_handler,
             resume_manager,
             collection,
         })
@@ -149,7 +155,8 @@ impl UnifiedExporter {
         let progress = Arc::new(AtomicU64::new(0));
         let progress_bar = self.create_progress_bar(profile.document_count, &profile);
 
-        // Start progress update task
+        // Start progress update task. Wrap the join handle in a guard so the task is aborted
+        // on every exit path (including `?` propagation), not only on the success branch.
         let pb_clone = progress_bar.clone();
         let progress_clone = progress.clone();
         let progress_task = tokio::spawn(async move {
@@ -158,15 +165,21 @@ impl UnifiedExporter {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
-
-        // Execute export with optimal strategy
-        let stats = match profile.optimal_strategy {
-            ExportStrategy::FastStream => {
-                self.export_fast_stream(&options, &features, progress.clone())
-                    .await?
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
             }
-            ExportStrategy::Parallel => {
-                self.export_parallel_optimized(&options, &features, progress.clone())
+        }
+        let _progress_guard = AbortOnDrop(progress_task);
+
+        // Execute export with optimal strategy.
+        // FastStream and Parallel share the same underlying pipeline today — Parallel only
+        // changes the announcement message, so we route both to `export_fast_stream` and
+        // mention parallelism in the message printed inside that function via `features`.
+        let stats = match profile.optimal_strategy {
+            ExportStrategy::FastStream | ExportStrategy::Parallel => {
+                self.export_fast_stream(&options, &features, progress.clone())
                     .await?
             }
             ExportStrategy::Resumable => {
@@ -174,9 +187,6 @@ impl UnifiedExporter {
                     .await?
             }
         };
-
-        // Clean up progress task
-        progress_task.abort();
 
         // Finish progress bar with success message
         progress_bar.finish_with_message(format!(
@@ -200,19 +210,18 @@ impl UnifiedExporter {
         &self,
         options: &UnifiedExportOptions,
     ) -> Result<ExportProfile> {
-        // Get document count
-        let document_count = if let Some(limit) = options.limit {
-            limit.min(
-                self.collection
-                    .count_documents(options.filter.clone(), None)
-                    .await
-                    .context("Failed to count documents")?,
-            )
-        } else {
-            self.collection
+        // Get document count, preferring the pre-computed hint to avoid a second round-trip
+        let raw_count = match options.total_count_hint {
+            Some(c) => c,
+            None => self
+                .collection
                 .count_documents(options.filter.clone(), None)
                 .await
-                .context("Failed to count documents")?
+                .context("Failed to count documents")?,
+        };
+        let document_count = match options.limit {
+            Some(limit) => limit.min(raw_count),
+            None => raw_count,
         };
 
         // Sample collection for size estimation
@@ -640,31 +649,33 @@ impl UnifiedExporter {
     fn display_export_stats(&self, stats: &ExportStats) {
         println!();
         println!("{} Export Statistics", style("📊").cyan().bold());
-        println!("┌─────────────────────────────────────────────────────┐");
+        println!("┌{}┐", "─".repeat(56));
         println!(
-            "│ Documents processed:                    {:>11} │",
-            stats.documents_processed
+            "│ {:<30} {:>22} │",
+            "Documents processed:", stats.documents_processed
         );
         println!(
-            "│ Documents exported:                     {:>11} │",
-            stats.documents_exported
+            "│ {:<30} {:>22} │",
+            "Documents exported:", stats.documents_exported
         );
 
         if stats.fields_discovered > 0 {
             println!(
-                "│ Fields discovered:                      {:>11} │",
-                stats.fields_discovered
+                "│ {:<30} {:>22} │",
+                "Fields discovered:", stats.fields_discovered
             );
         }
 
         println!(
-            "│ Bytes written:                         {:>12} │",
+            "│ {:<30} {:>22} │",
+            "Bytes written:",
             humansize::format_size(stats.bytes_written, humansize::BINARY)
         );
 
         println!(
-            "│ Processing time:                          {:>9.2}s │",
-            stats.processing_time_ms as f64 / 1000.0
+            "│ {:<30} {:>22} │",
+            "Processing time:",
+            format!("{:.2}s", stats.processing_time_ms as f64 / 1000.0)
         );
 
         let throughput = if stats.processing_time_ms > 0 {
@@ -674,18 +685,20 @@ impl UnifiedExporter {
         };
 
         println!(
-            "│ Throughput:                           {:>9} /s │",
-            throughput
+            "│ {:<30} {:>22} │",
+            "Throughput:",
+            format!("{} /s", throughput)
         );
 
         if !stats.errors.is_empty() {
             println!(
-                "│ Errors encountered:                     {:>11} │",
+                "│ {:<30} {:>22} │",
+                "Errors encountered:",
                 stats.errors.len()
             );
         }
 
-        println!("└─────────────────────────────────────────────────────┘");
+        println!("└{}┘", "─".repeat(56));
     }
 
     /// Export using fast streaming (small datasets)
@@ -695,15 +708,40 @@ impl UnifiedExporter {
         features: &ExportFeatures,
         progress: Arc<AtomicU64>,
     ) -> Result<ExportStats> {
-        // Use features for optimization
-        println!(
-            "{} Fast streaming mode: batch_size={}, buffer_size={}KB",
-            style("◦").dim(),
-            features.batch_size,
-            features.buffer_size / 1024
-        );
+        if features.enable_parallel {
+            println!(
+                "{} Parallel mode: {} threads, batch_size={}, buffer_size={}KB",
+                style("◦").dim(),
+                features.parallel_threads,
+                features.batch_size,
+                features.buffer_size / 1024,
+            );
+        } else {
+            println!(
+                "{} Fast streaming mode: batch_size={}, buffer_size={}KB",
+                style("◦").dim(),
+                features.batch_size,
+                features.buffer_size / 1024
+            );
+        }
 
         let start_time = std::time::Instant::now();
+
+        // Build FindOptions from UnifiedExportOptions
+        let mut find_options = FindOptions::default();
+        if let Some(limit) = options.limit {
+            find_options.limit = Some(limit as i64);
+        }
+        if let Some(skip) = options.skip {
+            find_options.skip = Some(skip);
+        }
+        if let Some(ref sort) = options.sort {
+            find_options.sort = Some(sort.clone());
+        }
+        find_options.batch_size = Some(features.batch_size as u32);
+        // Disable the server-side 10-minute idle cursor timeout: large exports trivially exceed
+        // it, and getting a CursorNotFound mid-stream leaves the output file inconsistent.
+        find_options.no_cursor_timeout = Some(true);
 
         // Use optimized exporters from basic mode
         match options.format {
@@ -716,6 +754,7 @@ impl UnifiedExporter {
                         &options.output_path,
                         &options.compression,
                         progress.clone(),
+                        Some(find_options),
                     )
                     .await?;
             }
@@ -728,6 +767,7 @@ impl UnifiedExporter {
                         &options.output_path,
                         &options.compression,
                         progress.clone(),
+                        Some(find_options),
                     )
                     .await?;
             }
@@ -740,6 +780,7 @@ impl UnifiedExporter {
                         &options.output_path,
                         &options.compression,
                         progress.clone(),
+                        Some(find_options),
                     )
                     .await?;
             }
@@ -768,27 +809,6 @@ impl UnifiedExporter {
             processing_time_ms,
             ..Default::default()
         })
-    }
-
-    /// Export using parallel optimization (medium datasets)
-    async fn export_parallel_optimized(
-        &self,
-        options: &UnifiedExportOptions,
-        features: &ExportFeatures,
-        progress: Arc<AtomicU64>,
-    ) -> Result<ExportStats> {
-        // Show parallel configuration
-        if features.enable_parallel {
-            println!(
-                "{} Parallel mode: {} threads, batch_size={}",
-                style("◦").dim(),
-                features.parallel_threads,
-                features.batch_size
-            );
-        }
-
-        // Reuse fast stream with parallel enabled
-        self.export_fast_stream(options, features, progress).await
     }
 
     /// Export with checkpointing (large datasets)
@@ -872,14 +892,17 @@ impl UnifiedExporter {
             session_id
         );
 
-        // Use the embedded resume manager and error handler for advanced resumable exports
-        let _can_resume = self.resume_manager.list_sessions().is_ok();
-        let _error_stats = self.error_handler.get_statistics();
+        // Verify the session exists before handing off — gives a clearer error than a deeper failure.
+        match self.resume_manager.load_session(session_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => anyhow::bail!("Resume session '{}' not found", session_id),
+            Err(e) => return Err(e.context("Failed to load resume session")),
+        }
 
         let enhanced_exporter = EnhancedEnterpriseExporter::new(
             self.performance_config.clone(),
             Some(ErrorHandlingConfig::default()),
-            None, // Use default checkpoint directory
+            None,
         )?;
 
         let progress = Arc::new(AtomicU64::new(0));

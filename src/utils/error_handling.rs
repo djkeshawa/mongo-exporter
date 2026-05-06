@@ -5,10 +5,19 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
     time::{Duration, Instant},
 };
+
+/// Acquire a `Mutex` guard while tolerating poisoning.
+///
+/// We use `std::sync::Mutex` here because no guard is held across an `.await`. A panic in any
+/// caller would otherwise poison the mutex permanently and cascade-crash all retry/error paths
+/// — a single failed export should not leave the process unable to handle further work.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 use tokio::time::sleep;
 
 /// Classification of different error types
@@ -72,6 +81,7 @@ pub struct ErrorDetails {
 
 /// Error handling configuration
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ErrorHandlingConfig {
     /// Maximum number of retry attempts
     pub max_retries: u32,
@@ -134,18 +144,18 @@ impl CircuitBreaker {
 
     /// Check if operation should be allowed
     pub fn can_execute(&self) -> bool {
-        let state = self.state.lock().unwrap().clone();
+        let state = lock_or_recover(&self.state).clone();
 
         match state {
             CircuitState::Closed => true,
             CircuitState::Open => {
                 // Check if timeout has passed
-                let last_failure = self.last_failure_time.lock().unwrap();
+                let last_failure = lock_or_recover(&self.last_failure_time);
                 if let Some(last_time) = *last_failure {
                     if last_time.elapsed().as_secs() >= self.config.circuit_breaker_timeout {
                         // Move to half-open state
                         drop(last_failure);
-                        *self.state.lock().unwrap() = CircuitState::HalfOpen;
+                        *lock_or_recover(&self.state) = CircuitState::HalfOpen;
                         return true;
                     }
                 }
@@ -157,7 +167,7 @@ impl CircuitBreaker {
 
     /// Record successful operation
     pub fn record_success(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_or_recover(&self.state);
         self.failure_count.store(0, Ordering::Relaxed);
         *state = CircuitState::Closed;
     }
@@ -165,16 +175,11 @@ impl CircuitBreaker {
     /// Record failed operation
     pub fn record_failure(&self) {
         let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
-        *self.last_failure_time.lock().unwrap() = Some(Instant::now());
+        *lock_or_recover(&self.last_failure_time) = Some(Instant::now());
 
         if failures >= self.config.circuit_breaker_threshold {
-            *self.state.lock().unwrap() = CircuitState::Open;
+            *lock_or_recover(&self.state) = CircuitState::Open;
         }
-    }
-
-    /// Get current state
-    pub fn get_state(&self) -> CircuitState {
-        self.state.lock().unwrap().clone()
     }
 }
 
@@ -213,22 +218,22 @@ impl ErrorStatistics {
     pub fn record_error(&self, error: &ErrorDetails) {
         // Update category count
         {
-            let mut categories = self.errors_by_category.lock().unwrap();
+            let mut categories = lock_or_recover(&self.errors_by_category);
             *categories.entry(error.category.clone()).or_insert(0) += 1;
         }
 
         // Update severity count
         {
-            let mut severities = self.errors_by_severity.lock().unwrap();
+            let mut severities = lock_or_recover(&self.errors_by_severity);
             *severities.entry(error.severity.clone()).or_insert(0) += 1;
         }
 
         // Update error rate
-        *self.last_error_time.lock().unwrap() = Some(Instant::now());
+        *lock_or_recover(&self.last_error_time) = Some(Instant::now());
 
         // Calculate simple error rate (errors in last minute)
         // In production, this would use a proper sliding window
-        *self.error_rate.lock().unwrap() += 1.0;
+        *lock_or_recover(&self.error_rate) += 1.0;
     }
 
     /// Record a retry attempt
@@ -462,48 +467,6 @@ impl AdvancedErrorHandler {
 
         final_delay.max(0.0) as u64
     }
-
-    /// Get error statistics
-    pub fn get_statistics(&self) -> ErrorStatisticsReport {
-        let categories = self.statistics.errors_by_category.lock().unwrap().clone();
-        let severities = self.statistics.errors_by_severity.lock().unwrap().clone();
-        let total_retries = self.statistics.total_retries.load(Ordering::Relaxed);
-        let recovery_successes = self.statistics.recovery_successes.load(Ordering::Relaxed);
-        let error_rate = *self.statistics.error_rate.lock().unwrap();
-
-        ErrorStatisticsReport {
-            errors_by_category: categories,
-            errors_by_severity: severities,
-            total_retries,
-            recovery_successes,
-            error_rate,
-            circuit_breaker_state: self.circuit_breaker.get_state(),
-        }
-    }
-
-    /// Reset statistics
-    #[allow(dead_code)]
-    pub fn reset_statistics(&self) {
-        self.statistics.errors_by_category.lock().unwrap().clear();
-        self.statistics.errors_by_severity.lock().unwrap().clear();
-        self.statistics.total_retries.store(0, Ordering::Relaxed);
-        self.statistics
-            .recovery_successes
-            .store(0, Ordering::Relaxed);
-        *self.statistics.error_rate.lock().unwrap() = 0.0;
-    }
-}
-
-/// Error statistics report
-#[derive(Debug)]
-pub struct ErrorStatisticsReport {
-    pub errors_by_category: std::collections::HashMap<ErrorCategory, u64>,
-    pub errors_by_severity: std::collections::HashMap<ErrorSeverity, u64>,
-    pub total_retries: u64,
-    pub recovery_successes: u64,
-    #[allow(dead_code)]
-    pub error_rate: f64,
-    pub circuit_breaker_state: CircuitState,
 }
 
 impl fmt::Display for ErrorCategory {
@@ -541,55 +504,4 @@ impl fmt::Display for CircuitState {
             CircuitState::HalfOpen => write!(f, "Half-Open"),
         }
     }
-}
-
-/// Display error statistics in a user-friendly format
-pub fn display_error_statistics(stats: &ErrorStatisticsReport) {
-    println!("📊 Error Handling Statistics");
-    println!("┌{}┐", "─".repeat(50));
-
-    // Circuit breaker status
-    let status_color = match stats.circuit_breaker_state {
-        CircuitState::Closed => "🟢",
-        CircuitState::HalfOpen => "🟡",
-        CircuitState::Open => "🔴",
-    };
-    println!(
-        "│ {:<30} {:>15} │",
-        "Circuit Breaker:",
-        format!("{} {}", status_color, stats.circuit_breaker_state)
-    );
-
-    // Retry statistics
-    println!("│ {:<30} {:>15} │", "Total Retries:", stats.total_retries);
-    println!(
-        "│ {:<30} {:>15} │",
-        "Recovery Successes:", stats.recovery_successes
-    );
-
-    if stats.total_retries > 0 {
-        let success_rate = (stats.recovery_successes as f64 / stats.total_retries as f64) * 100.0;
-        println!("│ {:<30} {:>14.1}% │", "Recovery Rate:", success_rate);
-    }
-
-    println!("├{}┤", "─".repeat(50));
-
-    // Errors by category
-    if !stats.errors_by_category.is_empty() {
-        println!("│ {:<48} │", "Errors by Category:");
-        for (category, count) in &stats.errors_by_category {
-            println!("│   {:<25} {:>20} │", format!("{}:", category), count);
-        }
-    }
-
-    // Errors by severity
-    if !stats.errors_by_severity.is_empty() {
-        println!("├{}┤", "─".repeat(50));
-        println!("│ {:<48} │", "Errors by Severity:");
-        for (severity, count) in &stats.errors_by_severity {
-            println!("│   {:<25} {:>20} │", format!("{}:", severity), count);
-        }
-    }
-
-    println!("└{}┘", "─".repeat(50));
 }
