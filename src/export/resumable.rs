@@ -285,10 +285,7 @@ impl ResumableExportManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(
-                &checkpoint_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o600));
         }
 
         // Clean up old checkpoints
@@ -436,10 +433,21 @@ impl ResumableExportManager {
 
     /// Resume export from checkpoint
     pub fn resume_from_checkpoint(&self, checkpoint: &ExportCheckpoint) -> Result<ResumeInfo> {
+        let output_mode = self.determine_output_mode(checkpoint)?;
+        let resume_filter = if matches!(&output_mode, OutputMode::Append) {
+            self.build_resume_filter(checkpoint)?
+        } else {
+            checkpoint.config.filter.clone()
+        };
+        let progress_offset = if matches!(&output_mode, OutputMode::Append) {
+            checkpoint.progress.documents_exported
+        } else {
+            0
+        };
         let resume_info = ResumeInfo {
-            resume_filter: self.build_resume_filter(checkpoint)?,
-            output_mode: self.determine_output_mode(checkpoint)?,
-            progress_offset: checkpoint.progress.documents_exported,
+            resume_filter,
+            output_mode,
+            progress_offset,
         };
 
         println!(
@@ -466,6 +474,10 @@ impl ResumableExportManager {
                         self.build_sorted_resume_filter(resume_filter, sort_doc, last_sort_key)?;
                 }
             }
+        } else if checkpoint.progress.documents_exported > 0 {
+            anyhow::bail!(
+                "Cannot resume append safely: checkpoint has progress but no cursor position"
+            );
         }
 
         Ok(resume_filter)
@@ -578,6 +590,50 @@ pub fn display_resumable_exports(exports: &[ExportCheckpoint]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mongo-exporter-{}-{:x}",
+            name,
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn checkpoint_for_output(output_path: String) -> ExportCheckpoint {
+        ExportCheckpoint {
+            session_id: "session-123".to_string(),
+            started_at: Utc::now(),
+            last_checkpoint: Utc::now(),
+            config: ExportConfig {
+                uri: String::new(),
+                database: "db".to_string(),
+                collection: "coll".to_string(),
+                filter: Document::new(),
+                format: ExportFormat::JsonLines,
+                compression: CompressionType::None,
+                output_path,
+                fields: None,
+                sort: None,
+                limit: Some(10),
+                skip: None,
+            },
+            progress: ExportProgress {
+                documents_processed: 5,
+                documents_exported: 5,
+                documents_failed: 0,
+                bytes_written: 5,
+                percentage_complete: 50.0,
+                eta_seconds: None,
+            },
+            cursor_state: CursorState::default(),
+            stats: CheckpointStats::default(),
+            last_error: None,
+            retry_count: 0,
+        }
+    }
 
     #[test]
     fn test_validate_session_id_accepts_safe_alphabet() {
@@ -618,5 +674,35 @@ mod tests {
         // Round-trip yields an empty URI; caller must repopulate from --uri.
         let restored: ExportConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.uri, "");
+    }
+
+    #[test]
+    fn test_resume_recreate_starts_from_zero_progress() {
+        let dir = test_dir("resume-recreate");
+        let output_path = dir.join("out.jsonl");
+        fs::write(&output_path, "modified").unwrap();
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let checkpoint = checkpoint_for_output(output_path.to_string_lossy().to_string());
+
+        let resume_info = manager.resume_from_checkpoint(&checkpoint).unwrap();
+
+        assert!(matches!(resume_info.output_mode, OutputMode::Recreate));
+        assert_eq!(resume_info.progress_offset, 0);
+        assert!(resume_info.resume_filter.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_resume_append_requires_cursor_position() {
+        let dir = test_dir("resume-no-cursor");
+        let output_path = dir.join("out.jsonl");
+        fs::write(&output_path, "12345").unwrap();
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let checkpoint = checkpoint_for_output(output_path.to_string_lossy().to_string());
+
+        let err = manager.resume_from_checkpoint(&checkpoint).unwrap_err();
+
+        assert!(err.to_string().contains("no cursor position"));
+        let _ = fs::remove_dir_all(dir);
     }
 }

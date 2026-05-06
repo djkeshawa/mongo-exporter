@@ -1,3 +1,17 @@
 target/
 .claude
 CLAUDE.md
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Stray tooling artifacts from other projects/global tools
+.dart_tool/
+.sentry-native/
+
+# Session/progress notes (not part of source)
+IMPROVEMENTS.md
+MEDIUM_PRIORITY_PROGRESS.md
+SESSION_SUMMARY.md

@@ -8,9 +8,8 @@ use std::path::Path;
 use crate::config::PerformanceConfig;
 use crate::config::{ConfigManager, ConnectionProfile};
 use crate::export::enterprise::export::ExportOptions;
-use crate::export::mongoexport::MongoExportRunner;
 use crate::export::resumable::ResumableExportManager;
-use crate::types::{CompressionType, ExportFormat, ExportMethod};
+use crate::types::{CompressionType, ExportFormat};
 use crate::utils::error_handling::ErrorHandlingConfig;
 
 pub fn create_theme() -> ColorfulTheme {
@@ -67,21 +66,21 @@ pub fn show_result_section(message: &str, is_success: bool) {
 }
 
 pub fn show_banner() {
-    let ascii_art = r#"
-███╗   ███╗ ██████╗ ███╗   ██╗ ██████╗  ██████╗ 
+    let ascii_art = r"
+███╗   ███╗ ██████╗ ███╗   ██╗ ██████╗  ██████╗
 ████╗ ████║██╔═══██╗████╗  ██║██╔════╝ ██╔═══██╗
 ██╔████╔██║██║   ██║██╔██╗ ██║██║  ███╗██║   ██║
 ██║╚██╔╝██║██║   ██║██║╚██╗██║██║   ██║██║   ██║
 ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║╚██████╔╝╚██████╔╝
-╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ 
-                                                 
-███████╗██╗  ██╗██████╗  ██████╗ ██████╗ ████████╗███████╗██████╗ 
+╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝
+
+███████╗██╗  ██╗██████╗  ██████╗ ██████╗ ████████╗███████╗██████╗
 ██╔════╝╚██╗██╔╝██╔══██╗██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝██╔══██╗
 █████╗   ╚███╔╝ ██████╔╝██║   ██║██████╔╝   ██║   █████╗  ██████╔╝
 ██╔══╝   ██╔██╗ ██╔═══╝ ██║   ██║██╔══██╗   ██║   ██╔══╝  ██╔══██╗
 ███████╗██╔╝ ██╗██║     ╚██████╔╝██║  ██║   ██║   ███████╗██║  ██║
 ╚══════╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-"#;
+";
 
     let subtitle = "Export MongoDB collections with ease and style";
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -233,53 +232,6 @@ pub fn get_export_format() -> Result<ExportFormat> {
     );
 
     Ok(formats[selection].clone())
-}
-
-/// Get export method with smart defaults
-pub fn get_export_method(estimated_docs: Option<u64>) -> Result<ExportMethod> {
-    let mongoexport_available = MongoExportRunner::is_available();
-
-    if !mongoexport_available {
-        println!();
-        println!("{} MongoExport not found in PATH", style("⚠️").yellow());
-        println!("{} Using native Rust implementation", style("ℹ️").blue());
-        return Ok(ExportMethod::Native);
-    }
-
-    let methods = vec![ExportMethod::MongoExport, ExportMethod::Native];
-
-    show_selection_section(
-        "Export Method",
-        "Choose export method - MongoExport is faster for large datasets",
-    );
-
-    // Show performance recommendation
-    if let Some(count) = estimated_docs {
-        let message = MongoExportRunner::get_performance_message(count);
-        println!();
-        println!("{} {}", style("💡").yellow(), style(message).dim());
-        println!();
-    }
-
-    let selection = match Select::with_theme(&create_theme())
-        .with_prompt("Select export method")
-        .items(&methods)
-        .default(0)
-        .interact()
-    {
-        Ok(selection) => selection,
-        Err(_) => {
-            show_result_section("Export method selection cancelled", false);
-            anyhow::bail!("Operation cancelled by user");
-        }
-    };
-
-    show_result_section(
-        &format!("Selected method: {}", &methods[selection].to_string()),
-        true,
-    );
-
-    Ok(methods[selection].clone())
 }
 
 pub fn get_compression_type() -> Result<CompressionType> {

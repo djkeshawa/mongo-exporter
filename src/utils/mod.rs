@@ -75,7 +75,9 @@ fn bson_to_json_value(value: mongodb::bson::Bson) -> serde_json::Value {
     use mongodb::bson::Bson;
     use serde_json::{Number, Value};
     match value {
-        Bson::Double(v) => Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null),
+        Bson::Double(v) => Number::from_f64(v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         Bson::String(v) => Value::String(v),
         Bson::Array(arr) => Value::Array(arr.into_iter().map(bson_to_json_value).collect()),
         Bson::Document(d) => Value::Object(

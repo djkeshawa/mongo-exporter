@@ -1,4 +1,5 @@
-use crate::utils::create_spinner;
+use crate::utils::error_handling::{AdvancedErrorHandler, ErrorHandlingConfig};
+use crate::utils::{create_spinner, mask_error_message, mask_uri, validate_uri_format};
 use anyhow::{Context, Result};
 use console::style;
 use mongodb::{
@@ -8,14 +9,30 @@ use mongodb::{
 };
 
 pub async fn connect_to_mongodb(uri: &str) -> Result<Client> {
-    let spinner = create_spinner("Connecting to MongoDB...");
+    connect_to_mongodb_with_retry(uri, ErrorHandlingConfig::default()).await
+}
+
+/// Connect to MongoDB, retrying the initial `ping` with exponential backoff and circuit-breaker
+/// protection (driven by `ErrorHandlingConfig`). Transient network/timeout failures are retried;
+/// authentication/permission failures fail fast.
+pub async fn connect_to_mongodb_with_retry(
+    uri: &str,
+    error_config: ErrorHandlingConfig,
+) -> Result<Client> {
+    validate_uri_format(uri)?;
+
+    let spinner = create_spinner(&format!("Connecting to MongoDB at {}...", mask_uri(uri)));
 
     let client_options = match ClientOptions::parse(uri).await {
         Ok(options) => options,
         Err(e) => {
             spinner.finish_with_message(format!("{}", style("❌ Invalid MongoDB URI").red()));
             println!();
-            println!("{} {}", style("Error:").red().bold(), e);
+            println!(
+                "{} {}",
+                style("Error:").red().bold(),
+                mask_error_message(&e.to_string())
+            );
             println!();
             println!("{}", style("Examples of valid MongoDB URIs:").yellow());
             println!("  mongodb://localhost:27017");
@@ -27,14 +44,29 @@ pub async fn connect_to_mongodb(uri: &str) -> Result<Client> {
 
     let client = Client::with_options(client_options).context("Failed to create MongoDB client")?;
 
-    // Test the connection
-    match client
-        .database("admin")
-        .run_command(doc! {"ping": 1}, None)
-        .await
-    {
+    // Probe the connection with retry. The handler classifies network/timeout errors as
+    // retryable and authentication errors as fatal, so we don't burn retries on bad credentials.
+    let handler = AdvancedErrorHandler::new(error_config);
+    let ping_result = handler
+        .execute_with_retry(|| {
+            let client = client.clone();
+            async move {
+                client
+                    .database("admin")
+                    .run_command(doc! {"ping": 1}, None)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        })
+        .await;
+
+    match ping_result {
         Ok(_) => {
-            spinner.finish_with_message(format!("{}", style("✅ Connected to MongoDB").green()));
+            spinner.finish_with_message(format!(
+                "{} Connected to MongoDB at {}",
+                style("✅").green(),
+                mask_uri(uri)
+            ));
             Ok(client)
         }
         Err(e) => {
@@ -52,7 +84,11 @@ pub async fn connect_to_mongodb(uri: &str) -> Result<Client> {
             println!("  • Authentication credentials are wrong");
             println!("  • Firewall blocking the connection");
             println!();
-            println!("{} {}", style("Technical details:").dim(), e);
+            println!(
+                "{} {}",
+                style("Technical details:").dim(),
+                mask_error_message(&e.to_string())
+            );
             anyhow::bail!("Failed to connect to MongoDB server");
         }
     }

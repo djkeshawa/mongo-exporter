@@ -125,6 +125,15 @@ struct ExportParams<'a> {
 async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     // Load configuration
     let config_manager = ConfigManager::new()?;
+    let selected_profile = if let Some(profile_name) = params.profile {
+        let profile = config_manager
+            .get_profile(profile_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", profile_name))?;
+        Some((profile_name, profile))
+    } else {
+        None
+    };
 
     // Check for resumable sessions first (interactive mode only)
     let resume_session_id = if !params.non_interactive && params.resume_session_id.is_none() {
@@ -146,18 +155,14 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             );
         }
         uri_from_env_or_cli
-    } else if let Some(profile_name) = params.profile {
-        if let Some(profile) = config_manager.get_profile(profile_name) {
-            println!(
-                "{} Using profile '{}': {}",
-                style("📋").cyan(),
-                profile_name,
-                profile.description.as_deref().unwrap_or("No description")
-            );
-            profile.uri.clone()
-        } else {
-            anyhow::bail!("Profile '{}' not found", profile_name);
-        }
+    } else if let Some((profile_name, profile)) = &selected_profile {
+        println!(
+            "{} Using profile '{}': {}",
+            style("📋").cyan(),
+            profile_name,
+            profile.description.as_deref().unwrap_or("No description")
+        );
+        profile.uri.clone()
     } else if params.non_interactive {
         anyhow::bail!(
             "No URI provided and running in non-interactive mode.\n\
@@ -177,16 +182,30 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     // Get database and collection (from profile, CLI args, or interactive)
     let (_database, collection) = if params.non_interactive {
         // Non-interactive mode - require database and collection from CLI
-        let db_name = params.database_name.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Database name required for non-interactive mode. Use --database option"
-            )
-        })?;
-        let coll_name = params.collection_name.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Collection name required for non-interactive mode. Use --collection option"
-            )
-        })?;
+        let db_name = params
+            .database_name
+            .or_else(|| {
+                selected_profile
+                    .as_ref()
+                    .and_then(|(_, p)| p.database.as_ref())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Database name required for non-interactive mode. Use --database option"
+                )
+            })?;
+        let coll_name = params
+            .collection_name
+            .or_else(|| {
+                selected_profile
+                    .as_ref()
+                    .and_then(|(_, p)| p.collection.as_ref())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Collection name required for non-interactive mode. Use --collection option"
+                )
+            })?;
 
         println!(
             "{} Using database: {}",
@@ -204,7 +223,11 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         (database, collection)
     } else {
         // Interactive mode or use CLI args if provided
-        let database = if let Some(db_name) = params.database_name {
+        let database = if let Some(db_name) = params.database_name.or_else(|| {
+            selected_profile
+                .as_ref()
+                .and_then(|(_, p)| p.database.as_ref())
+        }) {
             println!(
                 "{} Using specified database: {}",
                 style("🗄️").cyan(),
@@ -215,7 +238,11 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             select_database(&client).await?
         };
 
-        let collection = if let Some(coll_name) = params.collection_name {
+        let collection = if let Some(coll_name) = params.collection_name.or_else(|| {
+            selected_profile
+                .as_ref()
+                .and_then(|(_, p)| p.collection.as_ref())
+        }) {
             println!(
                 "{} Using specified collection: {}",
                 style("📋").cyan(),
@@ -232,6 +259,12 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     // Parse filter query
     let filter = if let Some(query_str) = params.query {
         serde_json::from_str(query_str).context("Failed to parse query JSON")?
+    } else if let Some((_, profile)) = &selected_profile {
+        if let Some(query_str) = &profile.filter {
+            serde_json::from_str(query_str).context("Failed to parse profile filter JSON")?
+        } else {
+            mongodb::bson::Document::new()
+        }
     } else if params.non_interactive {
         mongodb::bson::Document::new() // Empty filter
     } else {
@@ -243,10 +276,17 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
         || params.limit.is_some()
         || params.skip.is_some()
         || params.sort.is_some()
+        || selected_profile
+            .as_ref()
+            .is_some_and(|(_, p)| p.fields.is_some())
     {
         // CLI arguments provided, use them
         ExportOptions {
-            fields: params.fields.map(|s| parse_field_list(s)),
+            fields: params.fields.map(|s| parse_field_list(s)).or_else(|| {
+                selected_profile
+                    .as_ref()
+                    .and_then(|(_, p)| p.fields.clone())
+            }),
             limit: params.limit,
             skip: params.skip,
             sort: params
@@ -289,6 +329,8 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             cli::ExportFormatArg::Parquet => ExportFormat::Parquet,
             cli::ExportFormatArg::Bson => ExportFormat::Bson,
         }
+    } else if let Some((_, profile)) = &selected_profile {
+        profile.format.clone().unwrap_or(ExportFormat::JsonLines)
     } else if params.non_interactive {
         ExportFormat::JsonLines // Default
     } else {
@@ -301,6 +343,8 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             cli::CompressionArg::None => CompressionType::None,
             cli::CompressionArg::Gzip => CompressionType::Gzip,
         }
+    } else if let Some((_, profile)) = &selected_profile {
+        profile.compression.clone().unwrap_or(CompressionType::None)
     } else if params.non_interactive {
         CompressionType::None // Default
     } else {
@@ -313,6 +357,12 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
             cli::PerformanceModeArg::Balanced => PerformanceConfig::default(),
             cli::PerformanceModeArg::Memory => PerformanceConfig::memory_optimized(),
             cli::PerformanceModeArg::Speed => PerformanceConfig::speed_optimized(),
+        }
+    } else if let Some((_, profile)) = &selected_profile {
+        match profile.performance_mode.as_deref() {
+            Some("memory") => PerformanceConfig::memory_optimized(),
+            Some("speed") => PerformanceConfig::speed_optimized(),
+            _ => PerformanceConfig::default(),
         }
     } else if params.non_interactive {
         PerformanceConfig::default()
@@ -349,8 +399,14 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
                 ExportFormat::Bson => "bson",
             }
         );
+        let default_path = selected_profile
+            .as_ref()
+            .and_then(|(_, p)| p.output_dir.as_ref())
+            .map(|dir| std::path::Path::new(dir).join(&default_path))
+            .unwrap_or_else(|| std::path::PathBuf::from(default_path));
         // Validate the default path
-        let validated = validate_output_path(&default_path).context("Invalid output path")?;
+        let validated =
+            validate_output_path(&default_path.to_string_lossy()).context("Invalid output path")?;
         validated.to_string_lossy().to_string()
     } else {
         get_output_path(&export_format, &compression_type)?
@@ -419,10 +475,7 @@ async fn run_export_command(params: ExportParams<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn run_resume_command(
-    session_id: Option<&String>,
-    cli_uri: Option<&String>,
-) -> Result<()> {
+async fn run_resume_command(session_id: Option<&String>, cli_uri: Option<&String>) -> Result<()> {
     let resume_manager = ResumableExportManager::new(None)?;
 
     if let Some(session_id) = session_id {

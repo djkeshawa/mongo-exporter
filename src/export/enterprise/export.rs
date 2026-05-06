@@ -621,7 +621,11 @@ impl EnterpriseExporter {
                     // doubled the traversal cost for every non-empty value.
                     for (field_idx, field_name) in fields.iter().enumerate() {
                         let value = get_field_value(&document, field_name);
-                        batch_data[field_idx].push(if value.is_empty() { None } else { Some(value) });
+                        batch_data[field_idx].push(if value.is_empty() {
+                            None
+                        } else {
+                            Some(value)
+                        });
                     }
 
                     local_count += 1;

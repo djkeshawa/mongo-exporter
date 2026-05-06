@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use csv::Writer;
-use flate2::{write::GzEncoder, Compression};
 use futures::stream::StreamExt;
 use mongodb::{bson::Document, Collection};
 use std::{
-    fs::File,
-    io::{BufWriter, Write},
+    io::Write,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -14,7 +12,7 @@ use std::{
 
 use crate::config::PerformanceConfig;
 use crate::types::CompressionType;
-use crate::utils::get_field_value;
+use crate::utils::{create_buffered_writer, get_field_value};
 
 /// Optimized CSV exporter with incremental field discovery
 pub struct CsvOptimizer {
@@ -26,6 +24,7 @@ impl CsvOptimizer {
         Self { config }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn export_csv_streaming(
         &self,
         collection: &Collection<Document>,
@@ -33,39 +32,39 @@ impl CsvOptimizer {
         output_path: &str,
         compression: &CompressionType,
         exported_count: Arc<AtomicU64>,
+        find_options: Option<mongodb::options::FindOptions>,
+        fields: Option<Vec<String>>,
     ) -> Result<()> {
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path))?;
+        let writer: Box<dyn Write + Send> =
+            create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
-        let writer: Box<dyn Write> = match compression {
-            CompressionType::None => Box::new(BufWriter::with_capacity(
-                self.config.write_buffer_size,
-                file,
-            )),
-            CompressionType::Gzip => {
-                let gz_encoder = GzEncoder::new(file, Compression::default());
-                Box::new(BufWriter::with_capacity(
-                    self.config.write_buffer_size,
-                    gz_encoder,
-                ))
-            }
+        let fields = if let Some(fields) = fields {
+            fields
+        } else {
+            // Phase 1: Incremental field discovery with streaming
+            let field_discoverer = FieldDiscoverer::new(&self.config);
+            let fields = field_discoverer
+                .discover_fields_streaming(collection, filter, find_options.as_ref())
+                .await?;
+
+            println!(
+                "📋 Discovered {} unique fields across documents",
+                fields.len()
+            );
+            fields
         };
-
-        // Phase 1: Incremental field discovery with streaming
-        let field_discoverer = FieldDiscoverer::new(&self.config);
-        let fields = field_discoverer
-            .discover_fields_streaming(collection, filter)
-            .await?;
-
-        println!(
-            "📋 Discovered {} unique fields across documents",
-            fields.len()
-        );
 
         // Phase 2: Streaming CSV export with discovered fields
         let csv_streamer = CsvStreamer::new(&self.config);
         csv_streamer
-            .stream_to_csv(collection, filter, writer, fields, exported_count)
+            .stream_to_csv(
+                collection,
+                filter,
+                writer,
+                fields,
+                exported_count,
+                find_options,
+            )
             .await?;
 
         Ok(())
@@ -88,13 +87,14 @@ impl FieldDiscoverer {
         &self,
         collection: &Collection<Document>,
         filter: &Document,
+        find_options: Option<&mongodb::options::FindOptions>,
     ) -> Result<Vec<String>> {
         // Use the centralized CSV field discovery utility
         crate::utils::discover_csv_fields(
             collection,
             filter,
             self.config.csv_field_sample_size,
-            None,
+            find_options,
         )
         .await
     }
@@ -116,9 +116,10 @@ impl CsvStreamer {
         &self,
         collection: &Collection<Document>,
         filter: &Document,
-        writer: Box<dyn Write>,
+        writer: Box<dyn Write + Send>,
         fields: Vec<String>,
         exported_count: Arc<AtomicU64>,
+        find_options: Option<mongodb::options::FindOptions>,
     ) -> Result<()> {
         let mut csv_writer = Writer::from_writer(writer);
 
@@ -129,7 +130,7 @@ impl CsvStreamer {
 
         // Create fresh cursor for data export
         let mut cursor = collection
-            .find(filter.clone(), None)
+            .find(filter.clone(), find_options)
             .await
             .context("Failed to execute query for CSV export")?;
 
@@ -145,7 +146,7 @@ impl CsvStreamer {
                     // Process batch when full
                     if document_buffer.len() >= self.config.document_batch_size {
                         let batch_size = document_buffer.len();
-                        let rows = self.process_document_batch(&document_buffer, &fields)?;
+                        let rows = Self::process_document_batch(&document_buffer, &fields).await?;
 
                         // Write batch to CSV
                         for row in rows {
@@ -159,7 +160,8 @@ impl CsvStreamer {
 
                         // Clear buffer and flush periodically
                         document_buffer.clear();
-                        if total_exported % (self.config.document_batch_size as u64 * 5) == 0 {
+                        if total_exported.is_multiple_of(self.config.document_batch_size as u64 * 5)
+                        {
                             csv_writer.flush().context("Failed to flush CSV writer")?;
                         }
                     }
@@ -172,7 +174,7 @@ impl CsvStreamer {
 
         // Process remaining documents
         if !document_buffer.is_empty() {
-            let rows = self.process_document_batch(&document_buffer, &fields)?;
+            let rows = Self::process_document_batch(&document_buffer, &fields).await?;
             for row in rows {
                 csv_writer
                     .write_record(&row)
@@ -188,13 +190,11 @@ impl CsvStreamer {
         Ok(())
     }
 
-    fn process_document_batch(
-        &self,
+    async fn process_document_batch(
         documents: &[Document],
         fields: &[String],
     ) -> Result<Vec<Vec<String>>> {
         if documents.len() < 100 {
-            // Process sequentially for small batches
             Ok(documents
                 .iter()
                 .map(|doc| {
@@ -205,17 +205,23 @@ impl CsvStreamer {
                 })
                 .collect())
         } else {
-            // Process in parallel for large batches
-            use rayon::prelude::*;
-            Ok(documents
-                .par_iter()
-                .map(|doc| {
-                    fields
-                        .iter()
-                        .map(|field| get_field_value(doc, field))
-                        .collect()
-                })
-                .collect())
+            // Run rayon on a blocking-pool thread so it doesn't starve tokio workers.
+            let documents = documents.to_vec();
+            let fields = fields.to_vec();
+            tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                documents
+                    .par_iter()
+                    .map(|doc| {
+                        fields
+                            .iter()
+                            .map(|field| get_field_value(doc, field))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .await
+            .context("Parallel CSV row construction task panicked")
         }
     }
 }

@@ -57,3 +57,52 @@ impl PerformanceConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_performance_config() {
+        let config = PerformanceConfig::default();
+        assert_eq!(config.write_buffer_size, 256 * 1024);
+        assert_eq!(config.string_buffer_size, 64 * 1024);
+        assert_eq!(config.batch_flush_threshold, 32 * 1024);
+        assert_eq!(config.document_batch_size, 10000);
+        assert_eq!(config.csv_field_sample_size, 1000);
+        assert!(config.enable_parallel_processing);
+    }
+
+    #[test]
+    fn test_memory_optimized_config() {
+        let config = PerformanceConfig::memory_optimized();
+        // Memory optimized should have smaller buffers
+        assert!(config.write_buffer_size < PerformanceConfig::default().write_buffer_size);
+        assert!(config.document_batch_size < PerformanceConfig::default().document_batch_size);
+        assert!(!config.enable_parallel_processing);
+    }
+
+    #[test]
+    fn test_speed_optimized_config() {
+        let config = PerformanceConfig::speed_optimized();
+        // Speed optimized should have larger buffers
+        assert!(config.write_buffer_size > PerformanceConfig::default().write_buffer_size);
+        assert!(config.document_batch_size > PerformanceConfig::default().document_batch_size);
+        assert!(config.enable_parallel_processing);
+    }
+
+    #[test]
+    fn test_performance_config_relationships() {
+        let memory = PerformanceConfig::memory_optimized();
+        let balanced = PerformanceConfig::default();
+        let speed = PerformanceConfig::speed_optimized();
+
+        // Verify buffer size ordering: memory < balanced < speed
+        assert!(memory.write_buffer_size < balanced.write_buffer_size);
+        assert!(balanced.write_buffer_size < speed.write_buffer_size);
+
+        // Verify batch size ordering: memory < balanced < speed
+        assert!(memory.document_batch_size < balanced.document_batch_size);
+        assert!(balanced.document_batch_size < speed.document_batch_size);
+    }
+}

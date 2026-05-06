@@ -32,6 +32,7 @@ struct OptimizedExportParams<'a> {
     compression: &'a CompressionType,
     exported_count: Arc<AtomicU64>,
     find_options: Option<FindOptions>,
+    fields: Option<Vec<String>>,
 }
 
 /// Enhanced enterprise exporter with resumable exports and advanced error handling
@@ -146,7 +147,10 @@ impl EnhancedEnterpriseExporter {
                     "{} Export failed and checkpoint saved",
                     style("💾").yellow()
                 );
-                println!("Resume with: --resume {}", checkpoint.session_id);
+                println!(
+                    "Resume with: mongo-exporter resume {}",
+                    checkpoint.session_id
+                );
 
                 Err(error)
             }
@@ -184,10 +188,18 @@ impl EnhancedEnterpriseExporter {
                 );
             }
 
+            let query_filter = if matches!(&resume_info.output_mode, OutputMode::Append) {
+                resume_info.resume_filter.clone()
+            } else {
+                checkpoint.progress = Default::default();
+                checkpoint.cursor_state = Default::default();
+                checkpoint.stats = Default::default();
+                checkpoint.config.filter.clone()
+            };
             let find_options = self.build_resume_find_options(&checkpoint.config, resume_info)?;
             let writer = self.setup_resume_output(&checkpoint.config, resume_info)?;
 
-            (resume_info.resume_filter.clone(), find_options, writer)
+            (query_filter, find_options, writer)
         } else {
             // New export - check if we can use optimized versions
             if self.performance_config.enable_parallel_processing && resume_info.is_none() {
@@ -204,6 +216,7 @@ impl EnhancedEnterpriseExporter {
                         compression: &checkpoint.config.compression,
                         exported_count,
                         find_options: Some(find_options),
+                        fields: checkpoint.config.fields.clone(),
                     })
                     .await;
             }
@@ -361,6 +374,7 @@ impl EnhancedEnterpriseExporter {
                         params.compression,
                         params.exported_count.clone(),
                         params.find_options,
+                        params.fields,
                     )
                     .await?;
             }
@@ -398,6 +412,13 @@ impl EnhancedEnterpriseExporter {
         if let Some(ref sort) = config.sort {
             find_options.sort = Some(sort.clone());
         }
+        if let Some(ref fields) = config.fields {
+            let mut projection = Document::new();
+            for field in fields {
+                projection.insert(field, 1);
+            }
+            find_options.projection = Some(projection);
+        }
 
         // Set batch size based on performance config
         find_options.batch_size = Some(self.performance_config.document_batch_size as u32);
@@ -418,7 +439,12 @@ impl EnhancedEnterpriseExporter {
 
         // Adjust limit if resuming
         if let Some(original_limit) = config.limit {
-            let remaining = original_limit.saturating_sub(resume_info.progress_offset);
+            let exported = if matches!(&resume_info.output_mode, OutputMode::Append) {
+                resume_info.progress_offset
+            } else {
+                0
+            };
+            let remaining = original_limit.saturating_sub(exported);
             find_options.limit = Some(remaining as i64);
         }
 
@@ -490,6 +516,7 @@ impl EnhancedEnterpriseExporter {
             match result {
                 Ok(document) => {
                     stats.documents_processed += 1;
+                    Self::update_cursor_state(checkpoint, &document);
 
                     let json_str = serde_json::to_string(&document_to_json_value(&document))
                         .context("Failed to serialize document to JSON")?;
@@ -580,6 +607,7 @@ impl EnhancedEnterpriseExporter {
             match result {
                 Ok(document) => {
                     stats.documents_processed += 1;
+                    Self::update_cursor_state(checkpoint, &document);
                     document_batch.push(document);
 
                     let should_checkpoint = self
@@ -679,6 +707,7 @@ impl EnhancedEnterpriseExporter {
             match result {
                 Ok(document) => {
                     stats.documents_processed += 1;
+                    Self::update_cursor_state(checkpoint, &document);
 
                     let row: Vec<String> = fields
                         .iter()
@@ -733,6 +762,7 @@ impl EnhancedEnterpriseExporter {
             match result {
                 Ok(document) => {
                     stats.documents_processed += 1;
+                    Self::update_cursor_state(checkpoint, &document);
 
                     let bson_bytes = mongodb::bson::to_vec(&document)
                         .context("Failed to serialize document to BSON")?;
@@ -842,6 +872,7 @@ impl EnhancedEnterpriseExporter {
         while let Some(result) = cursor.next().await {
             match result {
                 Ok(document) => {
+                    Self::update_cursor_state(checkpoint, &document);
                     document_batch.push(document);
 
                     if document_batch.len() >= batch_size {
@@ -975,6 +1006,27 @@ impl EnhancedEnterpriseExporter {
         }
 
         Ok(())
+    }
+
+    fn update_cursor_state(checkpoint: &mut ExportCheckpoint, document: &Document) {
+        if let Ok(id) = document.get_object_id("_id") {
+            checkpoint.cursor_state.last_id = Some(id);
+        }
+
+        if let Some(sort) = &checkpoint.config.sort {
+            let mut sort_key = Document::new();
+            for field in sort.keys() {
+                if let Some(value) = document.get(field) {
+                    sort_key.insert(field, value.clone());
+                }
+            }
+            if let Ok(id) = document.get_object_id("_id") {
+                sort_key.insert("_id", id);
+            }
+            if !sort_key.is_empty() {
+                checkpoint.cursor_state.last_sort_key = Some(sort_key);
+            }
+        }
     }
 
     /// Save progress checkpoint. Updates the caller's checkpoint in place — in particular,

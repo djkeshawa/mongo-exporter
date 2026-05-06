@@ -732,6 +732,13 @@ impl UnifiedExporter {
         if let Some(ref sort) = options.sort {
             find_options.sort = Some(sort.clone());
         }
+        if let Some(ref fields) = options.fields {
+            let mut projection = Document::new();
+            for field in fields {
+                projection.insert(field, 1);
+            }
+            find_options.projection = Some(projection);
+        }
         find_options.batch_size = Some(features.batch_size as u32);
         // Disable the server-side 10-minute idle cursor timeout: large exports trivially exceed
         // it, and getting a CursorNotFound mid-stream leaves the output file inconsistent.
@@ -775,6 +782,7 @@ impl UnifiedExporter {
                         &options.compression,
                         progress.clone(),
                         Some(find_options),
+                        options.fields.clone(),
                     )
                     .await?;
             }

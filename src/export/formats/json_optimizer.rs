@@ -329,9 +329,7 @@ impl JsonOptimizer {
                 use rayon::prelude::*;
                 documents
                     .par_iter()
-                    .map(|d| {
-                        serde_json::to_string_pretty(&crate::utils::document_to_json_value(d))
-                    })
+                    .map(|d| serde_json::to_string_pretty(&crate::utils::document_to_json_value(d)))
                     .collect::<std::result::Result<Vec<_>, _>>()
             })
             .await
