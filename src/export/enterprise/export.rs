@@ -616,14 +616,12 @@ impl EnterpriseExporter {
                 Ok(document) => {
                     stats.documents_processed += 1;
 
-                    // Extract values for each field
+                    // Extract values for each field. get_field_value walks the document path
+                    // each call, so cache it once per (doc, field) — the previous version
+                    // doubled the traversal cost for every non-empty value.
                     for (field_idx, field_name) in fields.iter().enumerate() {
-                        let value = if get_field_value(&document, field_name).is_empty() {
-                            None
-                        } else {
-                            Some(get_field_value(&document, field_name))
-                        };
-                        batch_data[field_idx].push(value);
+                        let value = get_field_value(&document, field_name);
+                        batch_data[field_idx].push(if value.is_empty() { None } else { Some(value) });
                     }
 
                     local_count += 1;

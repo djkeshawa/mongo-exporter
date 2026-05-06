@@ -574,3 +574,49 @@ pub fn display_resumable_exports(exports: &[ExportCheckpoint]) {
         println!();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_session_id_accepts_safe_alphabet() {
+        assert!(validate_session_id("abc123-_xyz").is_ok());
+        assert!(validate_session_id("session-1234abcd").is_ok());
+    }
+
+    #[test]
+    fn test_validate_session_id_rejects_path_traversal() {
+        assert!(validate_session_id("../etc/passwd").is_err());
+        assert!(validate_session_id("..").is_err());
+        assert!(validate_session_id("a/b").is_err());
+        assert!(validate_session_id("a\\b").is_err());
+        assert!(validate_session_id("").is_err());
+    }
+
+    #[test]
+    fn test_export_config_uri_is_not_serialized() {
+        // Regression: checkpoints used to persist plaintext credentials in the cache dir.
+        let config = ExportConfig {
+            uri: "mongodb://user:secret@host:27017".to_string(),
+            database: "d".to_string(),
+            collection: "c".to_string(),
+            filter: Document::new(),
+            format: ExportFormat::JsonLines,
+            compression: CompressionType::None,
+            output_path: "out.jsonl".to_string(),
+            fields: None,
+            sort: None,
+            limit: None,
+            skip: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("secret"), "URI leaked into JSON: {}", json);
+        assert!(!json.contains("user:"), "URI leaked into JSON: {}", json);
+        assert!(!json.contains("\"uri\""));
+
+        // Round-trip yields an empty URI; caller must repopulate from --uri.
+        let restored: ExportConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.uri, "");
+    }
+}

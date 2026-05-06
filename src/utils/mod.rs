@@ -369,4 +369,50 @@ mod tests {
         assert!(result.contains("mongodb"));
         assert!(result.contains("export"));
     }
+
+    #[test]
+    fn test_document_to_json_value_objectid_is_plain_string() {
+        // Regression: previously serde_json::to_string(&doc) produced {"$oid":"..."}.
+        let oid = mongodb::bson::oid::ObjectId::new();
+        let doc = doc! { "_id": oid };
+        let value = document_to_json_value(&doc);
+        let s = serde_json::to_string(&value).unwrap();
+        assert!(!s.contains("$oid"), "got Extended JSON: {}", s);
+        assert!(s.contains(&oid.to_hex()));
+    }
+
+    #[test]
+    fn test_document_to_json_value_datetime_is_iso_string() {
+        let dt = mongodb::bson::DateTime::from_millis(1_699_000_000_000);
+        let doc = doc! { "ts": dt };
+        let value = document_to_json_value(&doc);
+        let s = serde_json::to_string(&value).unwrap();
+        assert!(!s.contains("$date"), "got Extended JSON: {}", s);
+        assert!(s.contains("2023"), "expected ISO-8601 year, got: {}", s);
+    }
+
+    #[test]
+    fn test_document_to_json_value_decimal128_is_plain_string() {
+        let dec: mongodb::bson::Decimal128 = "1.5".parse().unwrap();
+        let doc = doc! { "amount": dec };
+        let value = document_to_json_value(&doc);
+        let s = serde_json::to_string(&value).unwrap();
+        assert!(!s.contains("$numberDecimal"), "got Extended JSON: {}", s);
+        assert!(s.contains("1.5"));
+    }
+
+    #[test]
+    fn test_document_to_json_value_nested_and_array() {
+        let oid = mongodb::bson::oid::ObjectId::new();
+        let doc = doc! {
+            "nested": { "_id": oid, "name": "alice" },
+            "tags": ["a", "b"]
+        };
+        let value = document_to_json_value(&doc);
+        let s = serde_json::to_string(&value).unwrap();
+        assert!(!s.contains("$oid"));
+        assert!(s.contains(&oid.to_hex()));
+        assert!(s.contains("\"alice\""));
+        assert!(s.contains("[\"a\",\"b\"]"));
+    }
 }

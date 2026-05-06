@@ -40,7 +40,6 @@ pub struct UnifiedExportOptions {
 
     // Performance tuning (auto-configured)
     pub batch_size: Option<usize>,
-    pub parallel_threads: Option<usize>,
     pub buffer_size: Option<usize>,
 
     // Feature flags (smart defaults)
@@ -68,7 +67,6 @@ impl Default for UnifiedExportOptions {
             skip: None,
             sort: None,
             batch_size: None,
-            parallel_threads: None,
             buffer_size: None,
             force_resumable: None,
             collect_stats: true,
@@ -540,13 +538,6 @@ impl UnifiedExporter {
             buffer_size: options
                 .buffer_size
                 .unwrap_or(self.performance_config.write_buffer_size),
-            parallel_threads: options.parallel_threads.unwrap_or_else(|| {
-                if matches!(profile.optimal_strategy, ExportStrategy::Parallel) {
-                    profile.cpu_cores.min(8)
-                } else {
-                    1
-                }
-            }),
         }
     }
 
@@ -709,10 +700,13 @@ impl UnifiedExporter {
         progress: Arc<AtomicU64>,
     ) -> Result<ExportStats> {
         if features.enable_parallel {
+            // Don't claim N worker threads: JSONL serialization is single-worker today, only
+            // CSV and JSON Array actually fan out via rayon. What's accurate is the pipelined
+            // fetch/serialize/write topology. Keep the message honest until JSONL parallelism
+            // is finished.
             println!(
-                "{} Parallel mode: {} threads, batch_size={}, buffer_size={}KB",
+                "{} Pipelined mode: batch_size={}, buffer_size={}KB",
                 style("◦").dim(),
-                features.parallel_threads,
                 features.batch_size,
                 features.buffer_size / 1024,
             );
@@ -945,7 +939,6 @@ struct ExportFeatures {
     enable_compression: bool,
     batch_size: usize,
     buffer_size: usize,
-    parallel_threads: usize,
 }
 
 // Note: Use UnifiedExporter::new() and .export() directly instead of this function
