@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::utils::error_handling::{AdvancedErrorHandler, ErrorHandlingConfig};
 use crate::utils::{create_spinner, mask_error_message, mask_uri, validate_uri_format};
 use anyhow::{Context, Result};

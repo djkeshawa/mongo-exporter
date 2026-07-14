@@ -20,8 +20,9 @@ use crate::export::resumable::{
     ResumableExportManager, ResumeInfo,
 };
 use crate::types::{CompressionType, ExportFormat};
-use crate::utils::error_handling::ErrorHandlingConfig;
-use crate::utils::{document_to_json_value, wrap_writer_with_compression};
+use crate::utils::{
+    bson_value_to_string, document_to_json_value, get_bson_field, wrap_writer_with_compression,
+};
 
 /// Parameters for optimized export
 struct OptimizedExportParams<'a> {
@@ -40,13 +41,22 @@ pub struct EnhancedEnterpriseExporter {
     performance_config: PerformanceConfig,
     resume_manager: ResumableExportManager,
     start_time: Instant,
+    human_output: bool,
 }
 
 impl EnhancedEnterpriseExporter {
-    pub fn new(
+    /// Build an exporter without legacy human output so the strict CLI can own stdout/stderr.
+    pub fn new_silent(
         performance_config: PerformanceConfig,
-        _error_config: Option<ErrorHandlingConfig>,
         checkpoint_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Self::new_with_output(performance_config, checkpoint_dir, false)
+    }
+
+    fn new_with_output(
+        performance_config: PerformanceConfig,
+        checkpoint_dir: Option<std::path::PathBuf>,
+        human_output: bool,
     ) -> Result<Self> {
         let resume_manager = ResumableExportManager::new(checkpoint_dir)?;
 
@@ -54,6 +64,7 @@ impl EnhancedEnterpriseExporter {
             performance_config,
             resume_manager,
             start_time: Instant::now(),
+            human_output,
         })
     }
 
@@ -82,7 +93,7 @@ impl EnhancedEnterpriseExporter {
         } else {
             // Check for auto-resumable exports
             let resumable = self.resume_manager.find_resumable_exports()?;
-            if !resumable.is_empty() {
+            if !resumable.is_empty() && self.human_output {
                 println!(
                     "🔍 Found {} resumable export(s). Use --resume <session-id> to continue.",
                     resumable.len()
@@ -138,19 +149,26 @@ impl EnhancedEnterpriseExporter {
                 Ok(stats)
             }
             Err(error) => {
-                // Export failed, save checkpoint for potential resume
+                // Discard cursor/counter mutations that were not part of the last durable
+                // checkpoint. Otherwise a buffered-but-unwritten document could advance the
+                // resume key and be skipped permanently after restart.
+                if let Some(durable) = self.resume_manager.load_session(&checkpoint.session_id)? {
+                    checkpoint = durable;
+                }
                 self.resume_manager
                     .mark_failed(&mut checkpoint, error.to_string())?;
 
-                println!();
-                println!(
-                    "{} Export failed and checkpoint saved",
-                    style("💾").yellow()
-                );
-                println!(
-                    "Resume with: mongo-exporter resume {}",
-                    checkpoint.session_id
-                );
+                if self.human_output {
+                    println!();
+                    println!(
+                        "{} Export failed and checkpoint saved",
+                        style("💾").yellow()
+                    );
+                    println!(
+                        "Resume with: mongo-exporter checkpoint resume {}",
+                        checkpoint.session_id
+                    );
+                }
 
                 Err(error)
             }
@@ -172,7 +190,9 @@ impl EnhancedEnterpriseExporter {
         // Determine query filter and options
         let (query_filter, find_options, output_writer) = if let Some(resume_info) = resume_info {
             // Resuming export
-            println!("🔄 Resuming export from checkpoint...");
+            if self.human_output {
+                println!("🔄 Resuming export from checkpoint...");
+            }
 
             // Gzip resume is intrinsically unsafe today: bytes_written counts uncompressed
             // bytes while the on-disk file is compressed, so the size comparison in
@@ -227,6 +247,13 @@ impl EnhancedEnterpriseExporter {
             (checkpoint.config.filter.clone(), find_options, writer)
         };
 
+        // Resume counters are cumulative. Recreated outputs reset checkpoint.progress above,
+        // while append-mode resumes continue from the last durable checkpoint.
+        stats.documents_processed = checkpoint.progress.documents_processed;
+        stats.documents_exported = checkpoint.progress.documents_exported;
+        stats.bytes_written = checkpoint.progress.bytes_written;
+        exported_count.store(checkpoint.progress.documents_exported, Ordering::Relaxed);
+
         // CSV needs field discovery up front; cache the schema on the checkpoint so a resume
         // sees the same columns as the original run (otherwise we'd silently corrupt the file).
         if matches!(checkpoint.config.format, ExportFormat::Csv)
@@ -260,13 +287,15 @@ impl EnhancedEnterpriseExporter {
                 .await?;
             }
             ExportFormat::JsonArray => {
+                let is_appending =
+                    resume_info.is_some_and(|info| matches!(&info.output_mode, OutputMode::Append));
                 self.export_json_array_resumable(
                     collection,
                     &query_filter,
                     &find_options,
                     output_writer,
                     checkpoint,
-                    resume_info.is_some(),
+                    is_appending,
                     exported_count.clone(),
                     &mut stats,
                 )
@@ -335,7 +364,9 @@ impl EnhancedEnterpriseExporter {
         let start_time = Instant::now();
         let mut stats = ExportStats::default();
 
-        println!("⚡ Using optimized parallel export for {}", params.format);
+        if self.human_output {
+            println!("⚡ Using optimized parallel export for {}", params.format);
+        }
 
         match params.format {
             ExportFormat::JsonLines => {
@@ -402,7 +433,13 @@ impl EnhancedEnterpriseExporter {
         let mut find_options = FindOptions::default();
 
         if let Some(limit) = config.limit {
-            find_options.limit = Some(limit as i64);
+            if limit == 0 {
+                anyhow::bail!("Checkpoint limit must be greater than zero");
+            }
+            find_options.limit = Some(
+                i64::try_from(limit)
+                    .context("Checkpoint limit exceeds the MongoDB driver's supported range")?,
+            );
         }
 
         if let Some(skip) = config.skip {
@@ -469,7 +506,9 @@ impl EnhancedEnterpriseExporter {
         match &resume_info.output_mode {
             OutputMode::Create => self.setup_new_output(config),
             OutputMode::Recreate => {
-                println!("⚠️  Output file was modified, recreating...");
+                if self.human_output {
+                    println!("⚠️  Output file was modified, recreating...");
+                }
                 self.setup_new_output(config)
             }
             OutputMode::Append => {
@@ -510,7 +549,7 @@ impl EnhancedEnterpriseExporter {
             .context("Failed to execute query")?;
 
         let mut buffer = String::with_capacity(self.performance_config.string_buffer_size);
-        let mut local_count = 0u64;
+        let mut local_count = checkpoint.progress.documents_exported;
 
         while let Some(result) = cursor.next().await {
             match result {
@@ -541,12 +580,15 @@ impl EnhancedEnterpriseExporter {
                             .resume_manager
                             .should_checkpoint(checkpoint.last_checkpoint)
                         {
+                            writer
+                                .flush()
+                                .context("Failed to flush before checkpoint")?;
                             self.save_progress_checkpoint(checkpoint, local_count, stats)?;
                         }
                     }
                 }
                 Err(e) => {
-                    stats.errors.push(format!("Document read error: {}", e));
+                    return Err(e).context("Failed to read MongoDB document");
                 }
             }
         }
@@ -579,12 +621,12 @@ impl EnhancedEnterpriseExporter {
         find_options: &FindOptions,
         mut writer: Box<dyn Write + Send>,
         checkpoint: &mut ExportCheckpoint,
-        is_resuming: bool,
+        is_appending: bool,
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
         // Only emit the opening bracket on a fresh export. On resume the file already starts with `[`.
-        if !is_resuming {
+        if !is_appending {
             writer
                 .write_all(b"[\n")
                 .context("Failed to write array start")?;
@@ -599,7 +641,7 @@ impl EnhancedEnterpriseExporter {
 
         // Need a comma prefix if there are already documents in the file (i.e., we're resuming
         // after some elements were written, or this is not the first document of a new file).
-        let mut batch_needs_comma = is_resuming && checkpoint.progress.documents_exported > 0;
+        let mut batch_needs_comma = is_appending && checkpoint.progress.documents_exported > 0;
 
         let mut document_batch = Vec::with_capacity(self.performance_config.document_batch_size);
 
@@ -638,7 +680,7 @@ impl EnhancedEnterpriseExporter {
                     }
                 }
                 Err(e) => {
-                    stats.errors.push(format!("Document read error: {}", e));
+                    return Err(e).context("Failed to read MongoDB document");
                 }
             }
         }
@@ -730,7 +772,7 @@ impl EnhancedEnterpriseExporter {
                     }
                 }
                 Err(e) => {
-                    stats.errors.push(format!("Document read error: {}", e));
+                    return Err(e).context("Failed to read MongoDB document");
                 }
             }
         }
@@ -785,7 +827,7 @@ impl EnhancedEnterpriseExporter {
                     }
                 }
                 Err(e) => {
-                    stats.errors.push(format!("Document read error: {}", e));
+                    return Err(e).context("Failed to read MongoDB document");
                 }
             }
         }
@@ -808,10 +850,12 @@ impl EnhancedEnterpriseExporter {
         exported_count: Arc<AtomicU64>,
         stats: &mut ExportStats,
     ) -> Result<()> {
-        println!(
-            "{} Starting Parquet export with columnar optimization...",
-            style("📊").cyan()
-        );
+        if self.human_output {
+            println!(
+                "{} Starting Parquet export with columnar optimization...",
+                style("📊").cyan()
+            );
+        }
 
         // Use checkpoint configuration for output path and compression
         let output_path = &checkpoint.config.output_path;
@@ -828,11 +872,13 @@ impl EnhancedEnterpriseExporter {
         )
         .await?;
 
-        println!(
-            "{} Discovered {} fields for Parquet schema",
-            style("🔍").green(),
-            fields.len()
-        );
+        if self.human_output {
+            println!(
+                "{} Discovered {} fields for Parquet schema",
+                style("🔍").green(),
+                fields.len()
+            );
+        }
 
         // Create Arrow schema from discovered fields
         let arrow_fields: Vec<arrow::datatypes::Field> = fields
@@ -891,7 +937,7 @@ impl EnhancedEnterpriseExporter {
                     }
                 }
                 Err(e) => {
-                    stats.errors.push(format!("Document read error: {}", e));
+                    return Err(e).context("Failed to read MongoDB document");
                 }
             }
         }
@@ -906,11 +952,13 @@ impl EnhancedEnterpriseExporter {
         // Close the writer
         writer.close().context("Failed to close Parquet writer")?;
 
-        println!(
-            "{} Parquet export completed: {} documents",
-            style("✅").green(),
-            local_count
-        );
+        if self.human_output {
+            println!(
+                "{} Parquet export completed: {} documents",
+                style("✅").green(),
+                local_count
+            );
+        }
 
         Ok(())
     }
@@ -934,8 +982,11 @@ impl EnhancedEnterpriseExporter {
             let mut field_values = Vec::with_capacity(documents.len());
 
             for document in documents {
-                let value = crate::utils::get_field_value(document, field);
-                field_values.push(if value.is_empty() { None } else { Some(value) });
+                let value = match get_bson_field(document, field) {
+                    None | Some(mongodb::bson::Bson::Null | mongodb::bson::Bson::Undefined) => None,
+                    Some(value) => Some(bson_value_to_string(value)),
+                };
+                field_values.push(value);
             }
 
             let array = arrow::array::StringArray::from(field_values);
@@ -1009,19 +1060,19 @@ impl EnhancedEnterpriseExporter {
     }
 
     fn update_cursor_state(checkpoint: &mut ExportCheckpoint, document: &Document) {
-        if let Ok(id) = document.get_object_id("_id") {
-            checkpoint.cursor_state.last_id = Some(id);
+        if let Some(id) = document.get("_id") {
+            checkpoint.cursor_state.last_id = Some(id.clone());
         }
 
         if let Some(sort) = &checkpoint.config.sort {
             let mut sort_key = Document::new();
             for field in sort.keys() {
-                if let Some(value) = document.get(field) {
+                if let Some(value) = get_bson_field(document, field) {
                     sort_key.insert(field, value.clone());
                 }
             }
-            if let Ok(id) = document.get_object_id("_id") {
-                sort_key.insert("_id", id);
+            if let Some(id) = document.get("_id") {
+                sort_key.insert("_id", id.clone());
             }
             if !sort_key.is_empty() {
                 checkpoint.cursor_state.last_sort_key = Some(sort_key);
@@ -1038,11 +1089,14 @@ impl EnhancedEnterpriseExporter {
         exported_count: u64,
         stats: &ExportStats,
     ) -> Result<()> {
+        let bytes_written = std::fs::metadata(&checkpoint.config.output_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(stats.bytes_written);
         let progress = ExportProgress {
             documents_processed: stats.documents_processed,
             documents_exported: exported_count,
             documents_failed: stats.errors.len() as u64,
-            bytes_written: stats.bytes_written,
+            bytes_written,
             percentage_complete: 0.0,
             eta_seconds: None,
         };
@@ -1053,7 +1107,7 @@ impl EnhancedEnterpriseExporter {
             processing_rate: exported_count as f64
                 / self.start_time.elapsed().as_secs_f64().max(0.001),
             avg_document_size: if exported_count > 0 {
-                stats.bytes_written as f64 / exported_count as f64
+                bytes_written as f64 / exported_count as f64
             } else {
                 0.0
             },

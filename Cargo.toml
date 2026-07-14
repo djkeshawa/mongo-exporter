@@ -1,12 +1,20 @@
 [package]
 name = "mongo-exporter"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.83"
+description = "An automation-first, reproducible MongoDB collection exporter"
+license = "MIT"
+repository = "https://github.com/djkeshawa/mongo-exporter"
+readme = "README.md"
+keywords = ["mongodb", "export", "cli", "jsonl", "parquet"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 mongodb = "2.8"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+clap_complete = "4.5"
 dialoguer = "0.11"
 indicatif = "0.17"
 console = "0.15"
@@ -23,7 +31,13 @@ dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 arrow = "53.0"
-parquet = "53.0"
+parquet = { version = "53.0", default-features = false, features = ["arrow", "flate2"] }
 humansize = "2.1"
 regex = "1.10"
-dotenvy = "0.15"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

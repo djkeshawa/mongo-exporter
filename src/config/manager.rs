@@ -12,18 +12,25 @@ use crate::types::{CompressionType, ExportFormat};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Default connection settings
+    #[serde(default)]
     pub default: ConnectionProfile,
     /// Named profiles for different environments
+    #[serde(default)]
     pub profiles: HashMap<String, ConnectionProfile>,
     /// Global settings
+    #[serde(default)]
     pub settings: GlobalSettings,
 }
 
 /// Connection profile for different environments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionProfile {
-    /// MongoDB connection URI
+    /// Legacy plaintext URI. New profiles should leave this empty and use `uri_env`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uri: String,
+    /// Environment variable containing the MongoDB URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri_env: Option<String>,
     /// Default database name
     pub database: Option<String>,
     /// Default collection name
@@ -68,7 +75,8 @@ pub struct GlobalSettings {
 impl Default for ConnectionProfile {
     fn default() -> Self {
         Self {
-            uri: "mongodb://localhost:27017".to_string(),
+            uri: String::new(),
+            uri_env: Some("MONGODB_URI".to_string()),
             database: None,
             collection: None,
             format: Some(ExportFormat::JsonLines),
@@ -111,6 +119,42 @@ impl ConfigManager {
         Ok(Self { config })
     }
 
+    /// Load configuration from an explicit path without creating it.
+    pub fn from_path(path: PathBuf) -> Result<Self> {
+        if !path.exists() {
+            anyhow::bail!("Configuration file not found: {}", path.display());
+        }
+        let config = Self::load_config(&path)?;
+        Ok(Self { config })
+    }
+
+    /// Explicitly create a starter configuration file.
+    pub fn init(path: Option<PathBuf>, force: bool) -> Result<PathBuf> {
+        let path = match path {
+            Some(path) => path,
+            None => Self::get_config_path()?,
+        };
+
+        if path.exists() && !force {
+            anyhow::bail!(
+                "Configuration already exists at {} (use --force to replace it)",
+                path.display()
+            );
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
+        }
+
+        let content = toml::to_string_pretty(&Config::default())
+            .context("Failed to serialize default config")?;
+        fs::write(&path, content)
+            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Get the configuration file path.
     ///
     /// `MONGO_EXPORTER_CONFIG` overrides the location and is interpreted as a *file path*
@@ -131,34 +175,18 @@ impl ConfigManager {
         Ok(PathBuf::from("mongo-exporter.toml"))
     }
 
-    /// Load configuration from file. On first run, writes a default config and signals via
-    /// stderr (not stdout) so the bootstrap message doesn't pollute machine-parsed output.
+    /// Load configuration from file. Missing configuration is treated as the built-in default;
+    /// callers must opt into writing a file through `config init`.
     fn load_config(path: &Path) -> Result<Config> {
-        if path.exists() {
-            let content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-
-            toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config file: {}", path.display()))
-        } else {
-            let config = Config::default();
-
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create config directory: {}", parent.display())
-                })?;
-            }
-
-            let content =
-                toml::to_string_pretty(&config).context("Failed to serialize default config")?;
-
-            fs::write(path, content)
-                .with_context(|| format!("Failed to write default config: {}", path.display()))?;
-
-            eprintln!("📝 Created default configuration at: {}", path.display());
-
-            Ok(config)
+        if !path.exists() {
+            return Ok(Config::default());
         }
+
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
     /// Get a connection profile by name

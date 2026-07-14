@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
@@ -520,7 +522,24 @@ pub fn get_connection_profile() -> Result<String> {
             &format!("Using profile: {}", profiles[selection - 1].0),
             true,
         );
-        Ok(profile.uri.clone())
+        if !profile.uri.is_empty() {
+            anyhow::bail!(
+                "Profile '{}' contains a legacy plaintext URI; use uri_env instead",
+                profiles[selection - 1].0
+            );
+        }
+
+        if let Some(env_name) = &profile.uri_env {
+            std::env::var(env_name).with_context(|| {
+                format!(
+                    "Profile '{}' requires environment variable {}",
+                    profiles[selection - 1].0,
+                    env_name
+                )
+            })
+        } else {
+            get_connection_uri()
+        }
     }
 }
 

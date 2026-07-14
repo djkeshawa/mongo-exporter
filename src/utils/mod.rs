@@ -1,7 +1,8 @@
+#![allow(dead_code)]
+
 pub mod error_handling;
 pub mod secrets;
 
-pub use error_handling::*;
 pub use secrets::*;
 
 use anyhow::{Context, Result};
@@ -176,28 +177,26 @@ pub fn collect_field_names(
     }
 }
 
-pub fn get_field_value(doc: &mongodb::bson::Document, field_path: &str) -> String {
-    let parts: Vec<&str> = field_path.split('.').collect();
+pub fn get_bson_field<'a>(
+    doc: &'a mongodb::bson::Document,
+    field_path: &str,
+) -> Option<&'a mongodb::bson::Bson> {
+    let mut parts = field_path.split('.').peekable();
     let mut current = doc;
-
-    for (i, part) in parts.iter().enumerate() {
-        if let Some(value) = current.get(*part) {
-            if i == parts.len() - 1 {
-                // Last part, return the value
-                return bson_value_to_string(value);
-            } else if let mongodb::bson::Bson::Document(nested_doc) = value {
-                // Continue traversing
-                current = nested_doc;
-            } else {
-                // Can't traverse further, return empty
-                return String::new();
-            }
-        } else {
-            return String::new();
+    while let Some(part) = parts.next() {
+        let value = current.get(part)?;
+        if parts.peek().is_none() {
+            return Some(value);
         }
+        current = value.as_document()?;
     }
+    None
+}
 
-    String::new()
+pub fn get_field_value(doc: &mongodb::bson::Document, field_path: &str) -> String {
+    get_bson_field(doc, field_path)
+        .map(bson_value_to_string)
+        .unwrap_or_default()
 }
 
 /// Centralized CSV field discovery utility

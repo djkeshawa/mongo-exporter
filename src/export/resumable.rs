@@ -1,18 +1,27 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, Bson, Document};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use crate::types::{CompressionType, ExportFormat};
 
+const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_FILE_PREFIX: &str = "mongo-exporter-";
+
 /// Export checkpoint containing state information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportCheckpoint {
+    /// Storage schema marker used to distinguish exporter-owned state from unrelated JSON.
+    #[serde(default)]
+    pub checkpoint_version: u32,
     /// Unique export session ID
     pub session_id: String,
     /// Export start time
@@ -74,8 +83,8 @@ pub struct ExportProgress {
 /// MongoDB cursor state for resuming
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorState {
-    /// Last processed document ID
-    pub last_id: Option<mongodb::bson::oid::ObjectId>,
+    /// Last processed document ID. MongoDB permits any BSON value as `_id`.
+    pub last_id: Option<Bson>,
     /// Last processed document sort key
     pub last_sort_key: Option<Document>,
     /// Batch size being used
@@ -153,6 +162,127 @@ fn validate_session_id(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_checkpoint_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("checkpoint.json");
+
+    for _ in 0..32 {
+        let temporary = parent.join(format!(".{file_name}.{:x}.tmp", rand::random::<u64>()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to create temporary checkpoint near {}",
+                        path.display()
+                    )
+                })
+            }
+        };
+
+        let result = (|| -> Result<()> {
+            file.write_all(content)
+                .context("Failed to write checkpoint contents")?;
+            file.sync_all()
+                .context("Failed to sync checkpoint contents")?;
+            drop(file);
+            replace_checkpoint_file(&temporary, path)?;
+            #[cfg(unix)]
+            if let Ok(directory) = fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return result.with_context(|| format!("Failed to publish checkpoint: {}", path.display()));
+    }
+
+    anyhow::bail!("Could not allocate a temporary checkpoint file")
+}
+
+#[allow(clippy::needless_return)]
+fn replace_checkpoint_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let destination_wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let result = unsafe {
+            MoveFileExW(
+                source_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Windows could not replace {}", destination.display()));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+            .with_context(|| format!("Failed to replace {}", destination.display()))?;
+        Ok(())
+    }
+}
+
+fn is_managed_checkpoint_file(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if path.extension().and_then(|value| value.to_str()) != Some("json")
+        || !stem.starts_with(CHECKPOINT_FILE_PREFIX)
+        || validate_session_id(stem).is_err()
+    {
+        return false;
+    }
+
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<ExportCheckpoint>(&content).ok())
+        .is_some_and(|checkpoint| {
+            checkpoint.checkpoint_version == CHECKPOINT_VERSION && checkpoint.session_id == stem
+        })
+}
+
+fn combine_filters(base: Document, resume_condition: Document) -> Document {
+    if base.is_empty() {
+        resume_condition
+    } else {
+        doc! { "$and": [base, resume_condition] }
+    }
+}
+
 /// Manager for resumable exports
 pub struct ResumableExportManager {
     checkpoint_dir: PathBuf,
@@ -191,6 +321,7 @@ impl ResumableExportManager {
         let now = Utc::now();
 
         let checkpoint = ExportCheckpoint {
+            checkpoint_version: CHECKPOINT_VERSION,
             session_id: session_id.clone(),
             started_at: now,
             last_checkpoint: now,
@@ -203,8 +334,6 @@ impl ResumableExportManager {
         };
 
         self.save_checkpoint(&checkpoint)?;
-
-        println!("📋 Created resumable export session: {}", session_id);
         Ok(checkpoint)
     }
 
@@ -266,27 +395,31 @@ impl ResumableExportManager {
         Ok(sessions)
     }
 
+    /// Delete a persisted checkpoint after the operator has inspected it.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        let checkpoint_path = self.get_checkpoint_path(session_id);
+        if !checkpoint_path.exists() {
+            anyhow::bail!("Checkpoint '{}' not found", session_id);
+        }
+        fs::remove_file(&checkpoint_path).with_context(|| {
+            format!(
+                "Failed to delete checkpoint file: {}",
+                checkpoint_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// Save checkpoint to disk
     pub fn save_checkpoint(&self, checkpoint: &ExportCheckpoint) -> Result<()> {
+        validate_session_id(&checkpoint.session_id)?;
         let checkpoint_path = self.get_checkpoint_path(&checkpoint.session_id);
 
         let content =
             serde_json::to_string_pretty(checkpoint).context("Failed to serialize checkpoint")?;
 
-        fs::write(&checkpoint_path, content).with_context(|| {
-            format!(
-                "Failed to write checkpoint file: {}",
-                checkpoint_path.display()
-            )
-        })?;
-
-        // Restrict to owner-only on Unix. Checkpoints carry filter and field information that
-        // can be sensitive; until we drop more credentials/PII this is cheap defense in depth.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o600));
-        }
+        write_checkpoint_atomically(&checkpoint_path, content.as_bytes())?;
 
         // Clean up old checkpoints
         self.cleanup_old_checkpoints()?;
@@ -324,10 +457,6 @@ impl ResumableExportManager {
             })?;
         }
 
-        println!(
-            "✅ Export session {} completed and checkpoint removed",
-            session_id
-        );
         Ok(())
     }
 
@@ -378,7 +507,10 @@ impl ResumableExportManager {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .take(16)
             .collect();
-        format!("{}-{}-{:x}-{:x}", safe_db, safe_coll, nanos, suffix)
+        format!(
+            "{CHECKPOINT_FILE_PREFIX}{}-{}-{:x}-{:x}",
+            safe_db, safe_coll, nanos, suffix
+        )
     }
 
     /// Get checkpoint file path for session
@@ -394,11 +526,9 @@ impl ResumableExportManager {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        checkpoints.push((path, modified));
-                    }
+            if is_managed_checkpoint_file(&path) {
+                if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) {
+                    checkpoints.push((path, modified));
                 }
             }
         }
@@ -450,11 +580,6 @@ impl ResumableExportManager {
             progress_offset,
         };
 
-        println!(
-            "🔄 Resuming export from {} documents ({:.1}% complete)",
-            checkpoint.progress.documents_exported, checkpoint.progress.percentage_complete
-        );
-
         Ok(resume_info)
     }
 
@@ -462,18 +587,26 @@ impl ResumableExportManager {
     fn build_resume_filter(&self, checkpoint: &ExportCheckpoint) -> Result<Document> {
         let mut resume_filter = checkpoint.config.filter.clone();
 
-        // Add resume condition based on cursor state
+        // Add resume condition based on cursor state. A checkpoint without an explicit sort
+        // cannot prove that all unseen IDs compare after the last observed ID, so fail closed.
         if let Some(last_id) = &checkpoint.cursor_state.last_id {
-            // Use _id for resume if no sort specified
-            if checkpoint.config.sort.is_none() {
-                resume_filter.insert("_id", doc! {"$gt": last_id});
-            } else if let Some(ref sort_doc) = checkpoint.config.sort {
-                // Build complex resume condition for sorted queries
-                if let Some(ref last_sort_key) = checkpoint.cursor_state.last_sort_key {
-                    resume_filter =
-                        self.build_sorted_resume_filter(resume_filter, sort_doc, last_sort_key)?;
-                }
+            let sort_doc =
+                checkpoint.config.sort.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Cannot resume safely: checkpoint has no sort")
+                })?;
+            let last_sort_key =
+                checkpoint
+                    .cursor_state
+                    .last_sort_key
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Cannot resume sorted export: no sort key captured")
+                    })?;
+            if last_sort_key.get("_id") != Some(last_id) {
+                anyhow::bail!("Cannot resume safely: captured _id cursor values disagree");
             }
+            resume_filter =
+                self.build_sorted_resume_filter(resume_filter, sort_doc, last_sort_key)?;
         } else if checkpoint.progress.documents_exported > 0 {
             anyhow::bail!(
                 "Cannot resume append safely: checkpoint has progress but no cursor position"
@@ -486,35 +619,31 @@ impl ResumableExportManager {
     /// Build resume filter for sorted queries
     fn build_sorted_resume_filter(
         &self,
-        mut base_filter: Document,
+        base_filter: Document,
         sort_doc: &Document,
         last_sort_key: &Document,
     ) -> Result<Document> {
-        // For complex sorted resume, we need to handle multiple sort fields
-        // This is a simplified version - production would need more sophisticated logic
-
         let sort_fields: Vec<String> = sort_doc.keys().cloned().collect();
-
-        if sort_fields.len() == 1 {
-            let field = &sort_fields[0];
-            if let Some(last_value) = last_sort_key.get(field) {
-                let direction = sort_doc.get_i32(field).unwrap_or(1);
-                let operator = if direction >= 0 { "$gt" } else { "$lt" };
-                base_filter.insert(field, doc! {operator: last_value});
-            }
-        } else if let Some(last_id) = last_sort_key.get("_id") {
-            // For multi-field sorts, fall back to _id-based resume only if we actually
-            // captured the _id of the last processed document. Inserting an Option<&Bson>
-            // directly would serialize the enum wrapper and produce a filter that matches
-            // nothing, silently breaking resume.
-            base_filter.insert("_id", doc! {"$gt": last_id});
-        } else {
+        if sort_fields.as_slice() != ["_id"] {
             anyhow::bail!(
-                "Cannot resume sorted export: no _id captured in cursor state for multi-field sort"
+                "Cannot safely resume this sort; checkpointed exports must sort only by _id"
             );
         }
 
-        Ok(base_filter)
+        let direction = sort_doc
+            .get_i32("_id")
+            .context("Cannot resume safely: _id sort direction must be 1 or -1")?;
+        let operator = match direction {
+            1 => "$gt",
+            -1 => "$lt",
+            _ => anyhow::bail!("Cannot resume safely: _id sort direction must be 1 or -1"),
+        };
+        let last_value = last_sort_key
+            .get("_id")
+            .ok_or_else(|| anyhow::anyhow!("Cannot resume sorted export: _id was not captured"))?;
+        let mut comparison = Document::new();
+        comparison.insert(operator, last_value.clone());
+        Ok(combine_filters(base_filter, doc! { "_id": comparison }))
     }
 
     /// Determine how to handle output file for resume
@@ -604,6 +733,7 @@ mod tests {
 
     fn checkpoint_for_output(output_path: String) -> ExportCheckpoint {
         ExportCheckpoint {
+            checkpoint_version: CHECKPOINT_VERSION,
             session_id: "session-123".to_string(),
             started_at: Utc::now(),
             last_checkpoint: Utc::now(),
@@ -703,6 +833,102 @@ mod tests {
         let err = manager.resume_from_checkpoint(&checkpoint).unwrap_err();
 
         assert!(err.to_string().contains("no cursor position"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resume_preserves_original_id_filter_and_supports_string_ids() {
+        let dir = test_dir("resume-string-id");
+        let output_path = dir.join("out.jsonl");
+        fs::write(&output_path, "12345").unwrap();
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let mut checkpoint = checkpoint_for_output(output_path.to_string_lossy().to_string());
+        checkpoint.config.filter = doc! { "_id": { "$lt": "z" } };
+        checkpoint.config.sort = Some(doc! { "_id": 1 });
+        checkpoint.cursor_state.last_id = Some(Bson::String("m".to_string()));
+        checkpoint.cursor_state.last_sort_key = Some(doc! { "_id": "m" });
+
+        let resume = manager.resume_from_checkpoint(&checkpoint).unwrap();
+        let clauses = resume.resume_filter.get_array("$and").unwrap();
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(
+            clauses[0].as_document().unwrap(),
+            &doc! { "_id": { "$lt": "z" } }
+        );
+        assert_eq!(
+            clauses[1].as_document().unwrap(),
+            &doc! { "_id": { "$gt": "m" } }
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resume_fails_closed_without_a_deterministic_id_sort() {
+        let dir = test_dir("resume-unsafe-sort");
+        let output_path = dir.join("out.jsonl");
+        fs::write(&output_path, "12345").unwrap();
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let mut checkpoint = checkpoint_for_output(output_path.to_string_lossy().to_string());
+        checkpoint.cursor_state.last_id = Some(Bson::String("m".to_string()));
+        checkpoint.cursor_state.last_sort_key = Some(doc! { "_id": "m" });
+
+        let error = manager.resume_from_checkpoint(&checkpoint).unwrap_err();
+        assert!(error.to_string().contains("no sort"));
+
+        checkpoint.config.sort = Some(doc! { "created_at": 1 });
+        checkpoint.cursor_state.last_sort_key = Some(doc! { "created_at": 42, "_id": "m" });
+        let error = manager.resume_from_checkpoint(&checkpoint).unwrap_err();
+        assert!(error.to_string().contains("sort only by _id"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cleanup_never_deletes_unrelated_json_files() {
+        let dir = test_dir("safe-cleanup");
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let mut unrelated = Vec::new();
+        for index in 0..12 {
+            let path = dir.join(format!("user-data-{index}.json"));
+            fs::write(&path, format!(r#"{{"index":{index}}}"#)).unwrap();
+            unrelated.push(path);
+        }
+
+        for index in 0..12 {
+            let mut checkpoint = checkpoint_for_output("out.jsonl".to_string());
+            checkpoint.session_id = format!("{CHECKPOINT_FILE_PREFIX}test-{index}");
+            manager.save_checkpoint(&checkpoint).unwrap();
+        }
+
+        assert!(unrelated.iter().all(|path| path.exists()));
+        let managed_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| is_managed_checkpoint_file(&entry.path()))
+            .count();
+        assert_eq!(managed_count, 10);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_publication_is_atomic_and_leaves_no_temp_file() {
+        let dir = test_dir("atomic-checkpoint");
+        let manager = ResumableExportManager::new(Some(dir.clone())).unwrap();
+        let mut checkpoint = checkpoint_for_output("out.jsonl".to_string());
+        checkpoint.session_id = format!("{CHECKPOINT_FILE_PREFIX}atomic");
+        manager.save_checkpoint(&checkpoint).unwrap();
+
+        let stored = manager
+            .load_session(&checkpoint.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.checkpoint_version, CHECKPOINT_VERSION);
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
         let _ = fs::remove_dir_all(dir);
     }
 }

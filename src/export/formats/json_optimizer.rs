@@ -298,7 +298,7 @@ impl JsonOptimizer {
             }
 
             // Periodic progress updates
-            if count.is_multiple_of(1000) {
+            if count % 1000 == 0 {
                 exported_count.store(count, Ordering::Relaxed);
             }
         }

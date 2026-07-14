@@ -40,10 +40,10 @@ jobs:
       run: cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose
 
     - name: Check build
-      run: cargo check --verbose
+      run: cargo check --locked --verbose
 
   build:
     name: Build Check
@@ -71,4 +71,4 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Build
-      run: cargo build --release --verbose
+      run: cargo build --locked --release --verbose

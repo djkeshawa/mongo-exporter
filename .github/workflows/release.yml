@@ -5,22 +5,44 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish
+        required: true
+        default: v1.0.0
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Lint
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
+    - name: Test
+      run: cargo test --locked --all-features
+
   build-linux:
     name: Build Linux
+    needs: verify
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - name: Build
-      run: cargo build --release
+      run: cargo build --release --locked
     - name: Create archive
       run: |
         cd target/release
@@ -33,12 +55,13 @@ jobs:
 
   build-windows:
     name: Build Windows
+    needs: verify
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - name: Build
-      run: cargo build --release
+      run: cargo build --release --locked
     - name: Create archive
       run: |
         cd target/release
@@ -50,22 +73,32 @@ jobs:
         path: mongo-exporter-x86_64-pc-windows-msvc.zip
 
   build-macos:
-    name: Build macOS
-    runs-on: macos-latest
+    name: Build macOS (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
     - name: Build
-      run: cargo build --release
+      run: cargo build --release --locked --target ${{ matrix.target }}
     - name: Create archive
       run: |
-        cd target/release
-        tar -czf ../../mongo-exporter-x86_64-apple-darwin.tar.gz mongo-exporter
+        cd target/${{ matrix.target }}/release
+        tar -czf ../../../mongo-exporter-${{ matrix.target }}.tar.gz mongo-exporter
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: macos-binary
-        path: mongo-exporter-x86_64-apple-darwin.tar.gz
+        name: macos-${{ matrix.target }}
+        path: mongo-exporter-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release
@@ -90,14 +123,36 @@ jobs:
         ls -la
         cat checksums.txt
 
+    - name: Generate SPDX SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        path: .
+        format: spdx-json
+        output-file: release/mongo-exporter.sbom.spdx.json
+
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3.7.0
+
+    - name: Sign release checksums
+      run: |
+        cosign sign-blob --yes \
+          --output-signature release/checksums.txt.sig \
+          --output-certificate release/checksums.txt.pem \
+          release/checksums.txt
+
     - name: Get tag name
       id: tag
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "tag=v0.1.0" >> $GITHUB_OUTPUT
+          echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
         else
           echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
         fi
+
+    - name: Validate tag matches crate version
+      run: |
+        version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mongo-exporter") | .version')
+        test "${{ steps.tag.outputs.tag }}" = "v${version}"
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -117,16 +172,18 @@ jobs:
           **Manual download:**
           - **Linux**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
           - **Windows**: `mongo-exporter-x86_64-pc-windows-msvc.zip`
-          - **macOS**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
+          - **macOS (Apple Silicon)**: `mongo-exporter-aarch64-apple-darwin.tar.gz`
+          - **macOS (Intel)**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
           
           ### Quick Start
           ```bash
-          # Extract and run
-          tar -xzf mongo-exporter-*.tar.gz  # Linux/macOS
-          ./mongo-exporter export --uri "mongodb://localhost:27017"
+          MONGODB_URI="mongodb://localhost:27017" ./mongo-exporter export \
+            --database app --collection users --format jsonl --output users.jsonl
           ```
           
-          Verify downloads with `checksums.txt`.
+          Verify downloads with `checksums.txt` and its keyless Sigstore
+          signature (`checksums.txt.sig` / `checksums.txt.pem`). The release also
+          includes an SPDX SBOM.
         files: release/*
         draft: false
         prerelease: false

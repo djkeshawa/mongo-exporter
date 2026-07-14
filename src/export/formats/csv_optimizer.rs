@@ -160,8 +160,7 @@ impl CsvStreamer {
 
                         // Clear buffer and flush periodically
                         document_buffer.clear();
-                        if total_exported.is_multiple_of(self.config.document_batch_size as u64 * 5)
-                        {
+                        if total_exported % (self.config.document_batch_size as u64 * 5) == 0 {
                             csv_writer.flush().context("Failed to flush CSV writer")?;
                         }
                     }

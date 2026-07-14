@@ -1,741 +1,161 @@
+# mongo-exporter
 
-# MongoDB Export CLI
+An automation-first MongoDB collection exporter for reproducible, reviewable data
+pipelines. The strict `export` command never prompts, never creates configuration
+implicitly, refuses accidental overwrites, and publishes file outputs atomically.
 
-[![GitHub Release](https://img.shields.io/github/v/release/djkeshawa/mongo-exporter)](https://github.com/djkeshawa/mongo-exporter/releases)
-[![CI](https://github.com/djkeshawa/mongo-exporter/workflows/CI/badge.svg)](https://github.com/djkeshawa/mongo-exporter/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70+-brightgreen.svg)](https://www.rust-lang.org)
+## Quick start
 
-A powerful, beautiful command-line tool for exporting MongoDB collections with enterprise-grade features, multiple export modes, and comprehensive format support including analytics-optimized Parquet.
-
-```
-███╗   ███╗ ██████╗ ███╗   ██╗ ██████╗  ██████╗ 
-████╗ ████║██╔═══██╗████╗  ██║██╔════╝ ██╔═══██╗
-██╔████╔██║██║   ██║██╔██╗ ██║██║  ███╗██║   ██║
-██║╚██╔╝██║██║   ██║██║╚██╗██║██║   ██║██║   ██║
-██║ ╚═╝ ██║╚██████╔╝██║ ╚████║╚██████╔╝╚██████╔╝
-╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ 
-                                                 
-███████╗██╗  ██╗██████╗  ██████╗ ██████╗ ████████╗███████╗██████╗ 
-██╔════╝╚██╗██╔╝██╔══██╗██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝██╔══██╗
-█████╗   ╚███╔╝ ██████╔╝██║   ██║██████╔╝   ██║   █████╗  ██████╔╝
-██╔══╝   ██╔██╗ ██╔═══╝ ██║   ██║██╔══██╗   ██║   ██╔══╝  ██╔══██╗
-███████╗██╔╝ ██╗██║     ╚██████╔╝██║  ██║   ██║   ███████╗██║  ██║
-╚══════╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-
-                    Export MongoDB collections with ease and style
+```powershell
+$env:MONGODB_URI = "mongodb://localhost:27017"
+mongo-exporter export `
+  --database app `
+  --collection users `
+  --format jsonl `
+  --output exports/users.jsonl `
+  --create-dirs
 ```
 
-## Table of Contents
+Use `--uri-env NAME` when the URI is supplied by a secret manager under a
+non-standard variable. `--uri` is supported for one-off local use but should not
+be placed in scripts or CI logs.
 
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Export Formats](#export-formats)
-- [Command Line Options](#command-line-options)
-- [Example Sessions](#example-sessions)
-- [Filter Query Examples](#filter-query-examples)
-- [Commands](#commands)
-- [Performance Tuning](#performance-tuning)
-- [Enterprise Features](#enterprise-features)
-- [Development](#development)
-- [Contributing](#contributing)
-- [License](#license)
+The guided workflow is deliberately separate:
 
-## Features
-
-### 🚀 **Export Modes**
-- **Basic Mode**: Fast, simple exports for quick data extraction
-- **Enterprise Mode**: Advanced features with detailed statistics, field validation, and resumable exports
-
-### 🔗 **Connection & Automation**
-- **Easy Connection**: Connect using standard MongoDB URIs or interactive configuration
-- **Full Automation**: Complete non-interactive mode for CI/CD pipelines and scripts
-- **Connection Profiles**: Save and reuse connection configurations
-
-### 🎯 **Interactive & Automated Selection**
-- **Interactive Mode**: Browse databases and collections with arrow key navigation
-- **CLI Arguments**: Specify database/collection directly for automation
-- **Smart Defaults**: Intelligent suggestions based on your input
-
-### 🔍 **Advanced Filtering & Options**
-- **MongoDB Queries**: Apply complex MongoDB filters to export specific documents
-- **Field Selection**: Choose specific fields to export
-- **Sorting & Pagination**: Control document ordering and limit/skip functionality
-- **Performance Tuning**: Configurable performance modes (balanced, memory, speed)
-
-### 📊 **Multiple Export Formats**
-- **JSON Lines (.jsonl)**: Streaming format for large datasets
-- **JSON Array (.json)**: Pretty-printed format for smaller datasets  
-- **CSV (.csv)**: Automatic field flattening with nested object support
-- **Parquet (.parquet)**: Columnar format optimized for analytics workloads
-- **BSON (.bson)**: MongoDB native binary format
-
-### 🗜️ **Compression Support**
-- **None**: Uncompressed for fastest export
-- **Gzip**: Compressed for smaller file sizes (all formats)
-
-### 🎨 **Beautiful User Experience**
-- **Colorized Output**: Rich terminal styling with MongoDB green theming
-- **Progress Tracking**: Real-time progress bars with ETA and throughput metrics
-- **ASCII Art Banner**: Professional CLI presentation
-- **Spinner Animations**: Visual feedback during operations
-
-### 🛡️ **Enterprise Features**
-- **Detailed Statistics**: Export metrics including throughput, field discovery, and error counts
-- **Field Validation**: Verify field existence before export
-- **Error Handling**: Robust error recovery with detailed reporting
-- **Resumable Exports**: Continue interrupted exports from checkpoints
-- **Memory Optimization**: Streaming architecture for large datasets
-
-### ⚡ **High Performance**
-- **Streaming Export**: Memory-efficient processing of large collections
-- **Parallel Processing**: Multi-threaded operations for optimal performance
-- **Optimized I/O**: Buffered writers and batch processing
-- **Smart Batching**: Configurable batch sizes for different scenarios
-
-### 🔐 **Security Features** (NEW!)
-- **URI Masking**: Automatic masking of passwords in logs and error messages
-- **Environment Variables**: Support for `MONGODB_URI` and `MONGO_URI` environment variables
-- **Path Validation**: Protection against path traversal attacks
-- **Input Sanitization**: Comprehensive validation of all user inputs
-
-## Security
-
-### Automatic URI Masking
-All MongoDB connection URIs are automatically masked in logs and error messages to prevent credential leakage:
-
-```bash
-# Your URI:
-mongodb://admin:secretPassword@localhost:27017
-
-# What appears in logs:
-✅ Connected to MongoDB at mongodb://admin:****@localhost:27017
+```powershell
+mongo-exporter wizard
 ```
 
-This applies to:
-- Connection messages
-- Error messages
-- Progress updates
-- All console output
+## Contract
 
-### Environment Variable Support
-Avoid exposing credentials in command history by using environment variables:
+`export` requires `--database`, `--collection`, `--format`, and `--output`.
+`--query` accepts MongoDB Extended JSON and defaults to `{}`. `--query-file` is
+available for checked-in or generated filters. Events go to stderr, so data can
+be sent to stdout with `--output -` for JSONL, CSV, or BSON. When supplied,
+`--limit` must be a positive integer; omit it for an unlimited export.
 
-```bash
-# Set MongoDB URI in environment
-export MONGODB_URI="mongodb://user:password@localhost:27017"
+File exports use a temporary file in the destination directory and publish it only
+after the stream has been flushed and synced. Existing files require `--overwrite`.
+Missing directories require the explicit `--create-dirs` flag. A report can be
+written with `--report`; it contains the run id, query/schema digests, document and
+byte counts, output SHA-256, consistency mode, and warnings.
 
-# Or use MONGO_URI
-export MONGO_URI="mongodb+srv://user:password@cluster.mongodb.net"
+## Formats and fidelity
 
-# Run without --uri flag
-./mongo-exporter export --non-interactive \
-  --database "mydb" \
-  --collection "users" \
-  --output "users.json"
+- `jsonl` and `json` default to canonical MongoDB Extended JSON v2, preserving
+  BSON types. Use `--json-mode relaxed` for more readable JSON or `--json-mode plain`
+  when downstream tools require type-coerced JSON.
+- `bson` writes concatenated BSON documents and is the fidelity-first binary option.
+- `csv` and `parquet` require a versioned schema manifest. This prevents field order
+  from changing between runs.
+- Gzip is supported for file outputs. It is intentionally not allowed on stdout.
 
-# Output shows:
-# 🔗 Using MongoDB URI from environment variable
-# ✅ Connected to MongoDB at mongodb://user:****@localhost:27017
+Generate a schema manifest from a sample:
+
+```powershell
+mongo-exporter inspect schema `
+  --database app `
+  --collection users `
+  --sample-size 1000 `
+  --output schemas/users.v1.json `
+  --create-dirs
+
+mongo-exporter export `
+  --database app `
+  --collection users `
+  --format csv `
+  --schema schemas/users.v1.json `
+  --output exports/users.csv `
+  --create-dirs
 ```
 
-**Priority Order**:
-1. `--uri` CLI flag
-2. `MONGODB_URI` environment variable
-3. `MONGO_URI` environment variable
-4. Connection profile
-5. Interactive prompt
+The current Parquet writer stores manifest columns as nullable UTF-8 values,
+preserving empty strings while mapping missing, BSON null, and undefined values to
+Parquet null. The manifest is therefore an explicit output schema, not an implicit
+inference step.
 
-### Path Security
-Protection against path traversal attacks:
+## Consistency and large exports
 
-```bash
-# Dangerous paths are automatically blocked
-./mongo-exporter export --output "../../../etc/passwd"
-# Error: Path contains '..' which could lead to path traversal attack
+The default `--consistency best-effort` streams a normal MongoDB cursor. Use
+`--consistency snapshot` when a replica set or Atlas deployment can provide MongoDB
+snapshot read concern; unsupported servers fail with an error rather than silently
+downgrading. Snapshot mode cannot be combined with `--count` or checkpointing.
 
-# Parent directories are validated
-./mongo-exporter export --output "/nonexistent/dir/file.json"
-# Error: Parent directory does not exist: /nonexistent/dir
+Checkpointing is opt-in and deliberately narrow: uncompressed, best-effort JSONL,
+CSV, or BSON with deterministic `_id:1` ordering and no skip. The legacy resumable
+engine currently emits plain JSON, so JSONL checkpointing requires
+`--json-mode plain`.
 
-# Session IDs are validated (resume command)
-./mongo-exporter resume "../../../tmp/evil"
-# Error: Invalid session ID: only alphanumerics, '-', and '_' are allowed
+```powershell
+mongo-exporter export `
+  --database app `
+  --collection audit_events `
+  --format jsonl `
+  --json-mode plain `
+  --sort _id:1 `
+  --checkpoint-dir .checkpoints `
+  --output exports/audit.jsonl `
+  --create-dirs
+
+mongo-exporter checkpoint list --directory .checkpoints
+mongo-exporter checkpoint resume SESSION_ID --directory .checkpoints
+mongo-exporter checkpoint delete SESSION_ID --directory .checkpoints
 ```
 
-### Checkpoint Files
-Resumable exports write checkpoint files to `~/.cache/mongo-exporter/checkpoints/`:
+Checkpoint files never persist the MongoDB URI. Resuming requires `--uri`,
+`--uri-env`, or the configured environment variable.
 
-- **No credentials on disk**: the connection URI is not persisted to the checkpoint, so resuming requires re-supplying `--uri` (or `MONGODB_URI`).
-- **Owner-only permissions**: checkpoint files are created with `0o600` on Unix to limit exposure of filter and field metadata.
+## Profiles and configuration
 
-## Testing
+Profiles reference an environment variable and may carry non-secret metadata; the
+export command still requires its database, collection, format, and output arguments
+explicitly. Profiles do not store connection strings. Configuration is created only
+by an explicit command:
 
-Run the comprehensive test suite:
-
-```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific module tests
-cargo test secrets
-cargo test config
+```powershell
+mongo-exporter config init --path .mongo-exporter.toml
+mongo-exporter --config .mongo-exporter.toml config list
 ```
 
-**Test Coverage**:
-- **46 tests** with **100% pass rate**
-- Core modules well-tested
-- Security features fully covered (URI masking, path traversal, session ID validation)
-- Plain-JSON output and BSON type conversion regression-tested
+Example profile shape:
 
-See [TESTING.md](TESTING.md) for detailed testing guide.
-
-## Installation
-
-### Option 1: One-Line Install (Recommended)
-Download and install the latest release automatically:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/djkeshawa/mongo-exporter/main/install.sh | bash
+```toml
+[profiles.reporting]
+uri_env = "REPORTING_MONGODB_URI"
+description = "Read-only reporting cluster"
 ```
 
-### Option 2: Manual Download
-1. Go to [Releases](https://github.com/djkeshawa/mongo-exporter/releases)
-2. Download the appropriate binary for your platform:
-   - **Linux**: `mongo-exporter-x86_64-unknown-linux-gnu.tar.gz`
-   - **Windows**: `mongo-exporter-x86_64-pc-windows-msvc.zip`
-   - **macOS**: `mongo-exporter-x86_64-apple-darwin.tar.gz`
-3. Extract and run:
-   ```bash
-   # Linux/macOS
-   tar -xzf mongo-exporter-*.tar.gz
-   ./mongo-exporter --help
-   
-   # Windows (PowerShell)
-   Expand-Archive mongo-exporter-*.zip
-   .\mongo-exporter.exe --help
-   ```
+## Automation helpers
 
-### Option 3: Build from Source
-If you have Rust installed:
+Use `--log-format json` for machine-readable NDJSON events on stderr, `--count` for
+an exact preflight count, and `--no-progress` to suppress periodic progress events.
+Generate shell completion scripts with:
 
-```bash
-git clone https://github.com/djkeshawa/mongo-exporter
-cd mongo-exporter
-cargo build --release
-./target/release/mongo-exporter
+```powershell
+mongo-exporter completions powershell
+mongo-exporter completions bash
 ```
 
-### Option 4: Cargo Install (Rust users)
-```bash
-cargo install --git https://github.com/djkeshawa/mongo-exporter
-```
-
-## Quick Start
-
-After installation, run the CLI to start an interactive export session:
-
-```bash
-mongo-exporter
-```
-
-Or export directly with a MongoDB URI:
-
-```bash
-mongo-exporter export --uri "mongodb://localhost:27017"
-```
-
-For automation (scripts/CI/CD):
-
-```bash
-mongo-exporter export \
-  --uri "mongodb://localhost:27017" \
-  --database "myapp" \
-  --collection "users" \
-  --format json \
-  --output "users.json" \
-  --non-interactive
-```
-
-The export pipeline (`UnifiedExporter`) automatically picks the right strategy — fast streaming, parallel, or resumable with checkpoints — based on the collection size, available memory, and selected format. There is no manual `--mode` flag.
-
-## Usage
-
-### Interactive Mode (Recommended)
-Start the CLI and it will guide you through the export process:
-
-```bash
-./target/release/mongo-exporter export
-```
-
-### Non-Interactive Mode (Automation)
-Perfect for scripts and CI/CD pipelines:
-
-```bash
-./target/release/mongo-exporter export \
-  --uri "mongodb://localhost:27017" \
-  --database "myapp" \
-  --collection "users" \
-  --query '{"status": "active"}' \
-  --format jsonl \
-  --output users_active.jsonl \
-  --non-interactive
-```
-
-### Connection Examples
-
-#### Local MongoDB
-```bash
-mongo-exporter export --uri "mongodb://localhost:27017"
-```
-
-#### With Authentication
-```bash
-mongo-exporter export --uri "mongodb://username:password@localhost:27017/database"
-```
-
-#### MongoDB Atlas
-```bash
-mongo-exporter export --uri "mongodb+srv://username:password@cluster.mongodb.net"
-```
-
-#### Docker MongoDB
-```bash
-mongo-exporter export --uri "mongodb://admin:password@localhost:27017"
-```
-
-## Export Formats
-
-### JSON Lines (.jsonl) - Streaming Optimized
-One JSON document per line — ideal for streaming and large datasets. Output is **plain JSON**: ObjectIds become hex strings, dates become ISO-8601, Decimal128 becomes a string. The previous Extended JSON v2 wrappers (`{"$oid": ...}`, `{"$date": {"$numberLong": ...}}`, `{"$numberDecimal": ...}`) have been removed for compatibility with `jq`, pandas, and ad-hoc scripts.
-
-```json
-{"_id":"507f1f77bcf86cd799439011","name":"John","age":25,"created_at":"2024-01-15T08:30:00Z"}
-{"_id":"507f1f77bcf86cd799439012","name":"Jane","age":30,"balance":"1500.75"}
-```
-
-### JSON Array (.json) - Pretty Printed
-Pretty-printed JSON array — good for smaller datasets. Same plain-JSON conventions as above:
-```json
-[
-  {
-    "_id": "507f1f77bcf86cd799439011",
-    "name": "John",
-    "age": 25
-  },
-  {
-    "_id": "507f1f77bcf86cd799439012",
-    "name": "Jane",
-    "age": 30
-  }
-]
-```
-
-### CSV (.csv) - Automatic Field Flattening
-Comma-separated values with nested object support:
-```csv
-_id,name,age,address.city,address.country
-507f1f77bcf86cd799439011,John,25,New York,USA
-507f1f77bcf86cd799439012,Jane,30,London,UK
-```
-
-### Parquet (.parquet) - Analytics Optimized
-Columnar format perfect for data analytics and warehousing:
-- Columnar compression for optimal storage
-- Schema discovery from document structure
-- Compatible with Apache Spark, Pandas, and other analytics tools
-- Supports compression (None, Gzip)
-
-### BSON (.bson) - MongoDB Native
-MongoDB's native binary format for perfect data fidelity:
-- Preserves all MongoDB data types
-- Efficient for MongoDB-to-MongoDB transfers
-- Compact binary representation
-
-## Command Line Options
-
-### Core Options
-```bash
---uri <URI>                 MongoDB connection URI
---database <DATABASE>       Database name (required for non-interactive)
---collection <COLLECTION>   Collection name (required for non-interactive)
---query <QUERY>            Filter query in JSON format
---output <OUTPUT>          Output file path
-```
-
-### Export Configuration
-```bash
---format <FORMAT>          Export format: jsonl, json, csv, parquet, bson
---compression <TYPE>       Compression: none, gzip
---non-interactive         Run without user prompts
---resumable               Force resumable strategy (auto-selected for large collections)
-```
-
-### Advanced Options
-```bash
---fields <FIELDS>         Comma-separated list of fields to export
---limit <LIMIT>           Maximum number of documents to export
---skip <SKIP>             Number of documents to skip
---sort <SORT>             Sort specification (e.g., "created_at:1")
---perf-mode <MODE>        Performance mode: balanced, memory, speed
-```
-
-## Example Sessions
-
-### Interactive Export
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                          MongoDB Export CLI
-                      Export collections with ease and style
-                                   v0.1.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-? Enter MongoDB connection URI › mongodb://localhost:27017
-
-⣟ Connecting to MongoDB...
-✅ Connected to MongoDB
-
-📊 Found 3 databases
-? Select a database ›
-❯ my_app
-  shop_db
-  analytics
-
-📊 Found 5 collections in 'my_app'
-? Select a collection ›
-  products
-❯ users
-  orders
-
-? Enter the filter query (JSON format) › {"status": "active", "age": {"$gte": 18}}
-
-? Select export format ›
-  JSON Lines (.jsonl)
-  JSON Array (.json)
-  CSV (.csv)
-❯ Parquet (.parquet) - Analytics optimized
-  BSON (.bson) - MongoDB native format
-
-🚀 Starting export...
-📊 Starting Parquet export with columnar optimization...
-🔍 Discovered 25 fields for Parquet schema
-
-⠁ [00:00:15] [████████████████████████████████████████] 1247/1247 (83 docs/s) [00:00:00]
-
-📊 Export Statistics
-┌──────────────────────────────────────────────────────┐
-│ Documents processed:                            1247 │
-│ Documents exported:                             1247 │
-│ Fields discovered:                                25 │
-│ Bytes written:                              2.45 MB │
-│ Processing time:                             15.2ms │
-│ Throughput:                              82 docs/sec │
-└──────────────────────────────────────────────────────┘
-
-✅ Export completed successfully!
-```
-
-### Automated Script Example
-```bash
-#!/bin/bash
-
-# Export user data for analytics
-./mongo-exporter export \
-  --uri "mongodb://localhost:27017" \
-  --database "production" \
-  --collection "users" \
-  --query '{"created_at": {"$gte": {"$date": "2024-01-01T00:00:00Z"}}}' \
-  --format parquet \
-  --compression gzip \
-  --output "analytics/users_2024.parquet.gz" \
-  --non-interactive
-
-# Export orders as CSV for reporting
-./mongo-exporter export \
-  --uri "mongodb://localhost:27017" \
-  --database "production" \
-  --collection "orders" \
-  --fields "order_id,customer_id,total,status,created_at" \
-  --query '{"status": {"$in": ["completed", "shipped"]}}' \
-  --format csv \
-  --output "reports/completed_orders.csv" \
-  --non-interactive
-```
-
-## Filter Query Examples
-
-### Basic Filters
-
-#### All documents
-```json
-{}
-```
-
-#### Simple equality
-```json
-{"status": "active"}
-```
-
-#### Age range
-```json
-{"age": {"$gte": 18, "$lte": 65}}
-```
-
-#### Multiple conditions
-```json
-{"status": "active", "country": "USA"}
-```
-
-### Advanced Filters
-
-#### OR conditions
-```json
-{"$or": [{"plan": "premium"}, {"credits": {"$gt": 100}}]}
-```
-
-#### Complex nested query
-```json
-{"$and": [{"status": "active"}, {"$or": [{"plan": "premium"}, {"age": {"$gte": 25}}]}]}
-```
-
-#### Date range filter
-```json
-{"created_at": {"$gte": {"$date": "2023-01-01T00:00:00Z"}, "$lt": {"$date": "2024-01-01T00:00:00Z"}}}
-```
-
-#### Text search (case-insensitive)
-```json
-{"name": {"$regex": "john", "$options": "i"}}
-```
-
-#### Array operations
-```json
-{"tags": {"$in": ["mongodb", "database", "export"]}}
-```
-
-## Commands
-
-### `export`
-Main export command with interactive or non-interactive modes.
-
-**Options:**
-- Interactive mode: guided prompts for all configuration
-- Non-interactive mode: command-line arguments only
-- Strategy is auto-selected (fast streaming / pipelined / resumable) based on collection size and chosen format
-
-### `resume`
-Resume a previously interrupted export from checkpoint.
-
-```bash
-# List available resume sessions
-mongo-exporter list
-
-# Resume a specific session — requires --uri or MONGODB_URI
-mongo-exporter resume <session-id> --uri "mongodb://..."
-
-# Without a session id, prints available sessions
-mongo-exporter resume
-```
-
-> **Note**: The MongoDB URI is no longer persisted in checkpoint files (security fix), so the `resume` command requires the URI to be supplied again via `--uri` or the `MONGODB_URI`/`MONGO_URI` environment variable.
->
-> **Format limitations on resume**:
-> - **Parquet** cannot be resumed — the row-group index lives in the file footer, so partial files are not appendable. Re-run the export from scratch.
-> - **Gzip-compressed** outputs cannot be resumed — multi-stream gzip files are not portable across all readers (Python's `gzip` module reads only the first stream). Re-run without `--compression gzip`, or omit `--resume`.
-> - **JSONL**, **JSON Array**, **CSV**, and **BSON** all support resume.
-
-### `list`
-Display available resumable export sessions.
-
-## Performance Tuning
-
-### Performance Modes
-
-#### Balanced (Default)
-Optimized balance of speed and memory usage:
-```bash
---perf-mode balanced
-```
-
-#### Memory Optimized
-Reduced memory footprint for resource-constrained environments:
-```bash
---perf-mode memory
-```
-
-#### Speed Optimized
-Maximum performance with higher memory usage:
-```bash
---perf-mode speed
-```
-
-### Format-Specific Performance
-
-#### For Large Collections (>1M docs)
-- **Format**: JSON Lines or Parquet
-- **Mode**: Enterprise (automatically uses resumable exports)
-- **Compression**: Gzip for network/storage efficiency
-
-#### For Analytics Workloads
-- **Format**: Parquet with compression
-- **Benefits**: Columnar compression, schema inference, analytics tool compatibility
-
-#### For Fast Development/Testing
-- **Format**: JSON Lines
-- **Mode**: Basic
-- **Compression**: None
-
-## Enterprise Features
-
-### Export Statistics
-Detailed metrics surfaced after every export:
-- Documents processed, exported, and skipped
-- Fields discovered (for CSV/Parquet)
-- Bytes written and processing time
-- Throughput (documents per second)
-- Error summaries with counts
-
-### Field Validation
-Validates specified fields exist in the collection before export:
-- Samples documents to verify field presence
-- Shows available fields if specified ones are missing
-- Prevents exports with invalid field specifications
-
-### Resumable Exports
-Large exports can be resumed if interrupted:
-- Automatic checkpoint creation for exports >1M documents
-- Session management with unique identifiers
-- Progress preservation across restarts
-
-### Error Handling
-Comprehensive error recovery and reporting:
-- Individual document error tracking
-- Network timeout resilience
-- Detailed error summaries in statistics
-
-## Code Architecture
-
-The tool is built with a modular Rust architecture:
-
-### Core Modules
-- **CLI Module**: Command-line parsing with clap
-- **Database Module**: MongoDB connectivity and operations
-- **UI Module**: Interactive prompts and progress display
-- **Export Module**: Multi-format streaming export engine
-- **Enterprise Module**: Advanced features and statistics
-- **Config Module**: Performance and connection management
-
-### Export Engines
-- **Basic Exporter**: Fast, simple exports
-- **Enterprise Exporter**: Advanced features and statistics
-- **Enhanced Enterprise**: Resumable exports with checkpoints
-
-### Format Optimizers
-- **JSON Optimizer**: Parallel JSON processing
-- **CSV Optimizer**: Streaming field discovery and flattening
-- **Parquet Engine**: Columnar export with Arrow integration
-
-## Dependencies
-
-### Core Runtime
-- `tokio`: Async runtime for MongoDB operations
-- `mongodb`: Official MongoDB Rust driver
-- `futures`: Stream processing utilities
-
-### CLI & UI
-- `clap`: Command-line argument parsing
-- `dialoguer`: Interactive terminal prompts
-- `indicatif`: Progress bars and spinners
-- `console`: Terminal styling and colors
-
-### Data Processing
-- `serde`/`serde_json`: JSON serialization
-- `csv`: CSV file generation
-- `arrow`/`parquet`: Columnar data processing
-- `flate2`: Gzip compression
-
-### Utilities
-- `anyhow`: Error handling and context
-- `chrono`: Date/time processing
-- `rayon`: Parallel processing
+Exit codes are stable enough for automation: `1` is an operational failure, `2`
+is invalid usage, `4` is a connection/URI failure, `5` is query/schema failure, and
+`6` is an output/publication failure.
 
 ## Development
 
-### Building from Source
-```bash
-git clone <repository-url>
-cd mongo-export-cli
-cargo build --release
+The repository targets the stable Rust channel, declares Rust 1.83 as its minimum
+supported version, and includes a `rust-toolchain.toml` for consistent local
+tooling. Run:
+
+```powershell
+cargo fmt --all
+cargo check --offline
+cargo test --offline
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-### Development Commands
-```bash
-# Build in debug mode
-cargo build
-
-# Run with specific options
-cargo run -- export --uri "mongodb://localhost:27017"
-
-# Check for errors
-cargo check
-
-# Run linter  
-cargo clippy
-
-# Format code
-cargo fmt
-
-# Run tests
-cargo test
-```
-
-### Code Quality
-```bash
-# Check for unused dependencies
-cargo machete  # if installed
-
-# Security audit
-cargo audit    # if installed
-
-# Performance profiling
-cargo build --release
-perf record ./target/release/mongo-exporter export [options]
-```
-
-## Error Handling
-
-The tool provides comprehensive error handling with user-friendly messages:
-
-### Connection Issues
-- Invalid URIs with format suggestions
-- Network connectivity problems with troubleshooting
-- Authentication failures with credential guidance
-- Timeout handling with retry suggestions
-
-### Database Issues  
-- Permission errors with required privilege information
-- Missing databases/collections with available options
-- Schema validation errors with field suggestions
-
-### Export Issues
-- File permission errors with path validation
-- Disk space warnings with size estimations
-- Format-specific errors with alternative suggestions
-- Memory issues with performance mode recommendations
-
-## Contributing
-
-We welcome contributions! Please see our contributing guidelines for:
-- Code style and formatting requirements
-- Testing procedures and coverage expectations
-- Pull request workflow and review process
-- Issue reporting and feature request templates
+The MongoDB integration paths require a reachable MongoDB deployment; unit tests
+cover parsing, security-sensitive path handling, checkpoints, and atomic publication.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT
