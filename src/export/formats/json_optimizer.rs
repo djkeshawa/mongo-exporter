@@ -144,7 +144,8 @@ impl JsonOptimizer {
         }
 
         let mut cursor = collection
-            .find(filter.clone(), find_options)
+            .find(filter.clone())
+            .with_options(find_options)
             .await
             .context("Failed to execute query")?;
 
@@ -225,7 +226,8 @@ impl JsonOptimizer {
         find_options: Option<mongodb::options::FindOptions>,
     ) -> Result<()> {
         let mut cursor = collection
-            .find(filter, find_options)
+            .find(filter)
+            .with_options(find_options)
             .await
             .context("Failed to execute query")?;
 

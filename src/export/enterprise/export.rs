@@ -213,7 +213,8 @@ impl EnterpriseExporter {
 
         // Sample a few documents to check field existence
         let mut cursor = collection
-            .find(filter.clone(), FindOptions::builder().limit(100).build())
+            .find(filter.clone())
+            .with_options(FindOptions::builder().limit(100).build())
             .await
             .context("Failed to execute validation query")?;
 
@@ -274,7 +275,8 @@ impl EnterpriseExporter {
             create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -342,7 +344,8 @@ impl EnterpriseExporter {
             .context("Failed to write array start")?;
 
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -425,7 +428,8 @@ impl EnterpriseExporter {
 
         // Export data
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -520,7 +524,8 @@ impl EnterpriseExporter {
             create_buffered_writer(output_path, compression, self.config.write_buffer_size)?;
 
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -603,7 +608,8 @@ impl EnterpriseExporter {
 
         // Second pass: stream documents and write in batches
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 

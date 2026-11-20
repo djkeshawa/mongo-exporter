@@ -219,7 +219,8 @@ pub async fn discover_csv_fields(
     });
 
     let mut cursor = collection
-        .find(filter.clone(), options)
+        .find(filter.clone())
+        .with_options(options)
         .await
         .context("Failed to execute field discovery query")?;
 

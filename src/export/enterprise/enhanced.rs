@@ -544,7 +544,8 @@ impl EnhancedEnterpriseExporter {
         stats: &mut ExportStats,
     ) -> Result<()> {
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -633,7 +634,8 @@ impl EnhancedEnterpriseExporter {
         }
 
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -739,7 +741,8 @@ impl EnhancedEnterpriseExporter {
         }
 
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -794,7 +797,8 @@ impl EnhancedEnterpriseExporter {
         stats: &mut ExportStats,
     ) -> Result<()> {
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute query")?;
 
@@ -907,7 +911,8 @@ impl EnhancedEnterpriseExporter {
 
         // Process documents in batches using provided find_options
         let mut cursor = collection
-            .find(filter.clone(), find_options.clone())
+            .find(filter.clone())
+            .with_options(find_options.clone())
             .await
             .context("Failed to execute MongoDB query")?;
 
