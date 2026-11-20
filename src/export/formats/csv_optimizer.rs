@@ -130,7 +130,8 @@ impl CsvStreamer {
 
         // Create fresh cursor for data export
         let mut cursor = collection
-            .find(filter.clone(), find_options)
+            .find(filter.clone())
+            .with_options(find_options)
             .await
             .context("Failed to execute query for CSV export")?;
 

@@ -55,7 +55,7 @@ pub async fn connect_to_mongodb_with_retry(
             async move {
                 client
                     .database("admin")
-                    .run_command(doc! {"ping": 1}, None)
+                    .run_command(doc! {"ping": 1})
                     .await
                     .map_err(anyhow::Error::from)
             }
@@ -97,7 +97,7 @@ pub async fn connect_to_mongodb_with_retry(
 }
 
 pub async fn get_database_names(client: &Client) -> Result<Vec<String>> {
-    match client.list_database_names(None, None).await {
+    match client.list_database_names().await {
         Ok(databases) => {
             let user_databases: Vec<String> = databases
                 .into_iter()
@@ -131,7 +131,7 @@ pub async fn get_database_names(client: &Client) -> Result<Vec<String>> {
 }
 
 pub async fn get_collection_names(database: &Database) -> Result<Vec<String>> {
-    match database.list_collection_names(None).await {
+    match database.list_collection_names().await {
         Ok(collections) => {
             if collections.is_empty() {
                 println!();

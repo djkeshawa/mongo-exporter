@@ -543,7 +543,7 @@ async fn connect(uri: &str) -> Result<Client> {
     for attempt in 0..3 {
         match client
             .database("admin")
-            .run_command(mongodb::bson::doc! { "ping": 1 }, None)
+            .run_command(mongodb::bson::doc! { "ping": 1 })
             .await
         {
             Ok(_) => return Ok(client),
@@ -798,7 +798,8 @@ async fn run_export(args: ExportArgs, config_path: Option<&Path>) -> Result<()> 
         count_options.limit = args.limit;
         count_options.skip = args.skip;
         let count = collection
-            .count_documents(filter.clone(), Some(count_options))
+            .count_documents(filter.clone())
+            .with_options(count_options)
             .await
             .context("Failed to count matching documents")?;
         emit(
@@ -1080,7 +1081,8 @@ async fn run_resumable_export(args: ExportArgs, config_path: Option<&Path>) -> R
         count_options.limit = args.limit;
         count_options.skip = args.skip;
         let count = collection
-            .count_documents(filter.clone(), Some(count_options))
+            .count_documents(filter.clone())
+            .with_options(count_options)
             .await
             .context("Failed to count matching documents")?;
         emit(
@@ -1199,7 +1201,8 @@ async fn write_stream(
     }
 
     let mut cursor = collection
-        .find(filter.clone(), find_options.clone())
+        .find(filter.clone())
+        .with_options(find_options.clone())
         .await
         .context("Failed to execute MongoDB query")?;
     let mut count = 0u64;
@@ -1344,7 +1347,8 @@ async fn write_parquet(
     let mut parquet_writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(properties))
         .context("Failed to create Parquet writer")?;
     let mut cursor = collection
-        .find(filter.clone(), find_options.clone())
+        .find(filter.clone())
+        .with_options(find_options.clone())
         .await
         .context("Failed to execute MongoDB query")?;
     let batch_size = find_options.batch_size.unwrap_or(1_000).max(1) as usize;
@@ -1419,7 +1423,8 @@ async fn infer_schema(
     options.limit = Some(sample_size.min(i64::MAX as usize) as i64);
     options.batch_size = Some(sample_size.min(u32::MAX as usize) as u32);
     let mut cursor = collection
-        .find(filter.clone(), options)
+        .find(filter.clone())
+        .with_options(options)
         .await
         .context("Failed to sample MongoDB documents")?;
     let mut fields = std::collections::HashSet::new();
